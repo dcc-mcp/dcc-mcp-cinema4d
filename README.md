@@ -59,10 +59,10 @@ allowed root is the adapter's current working directory.
 
 ```bash
 dcc-mcp-cli list
-dcc-mcp-cli search Cinema 4D status --dcc-type cinema4d
-dcc-mcp-cli load-skill cinema4d-session --dcc-type cinema4d --instance-id <id>
-dcc-mcp-cli describe cinema4d.<id>.get_status
-dcc-mcp-cli call cinema4d.<id>.get_status --json '{}'
+dcc-mcp-cli search Cinema 4D status --dcc-type c4d
+dcc-mcp-cli load-skill cinema4d-session --dcc-type c4d --instance-id <id>
+dcc-mcp-cli describe c4d.<id>.get_status
+dcc-mcp-cli call c4d.<id>.get_status --json '{}'
 ```
 
 Load `cinema4d-modeling` only when modeling, interchange, or rendering tools are needed.
