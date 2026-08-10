@@ -19,6 +19,17 @@ def test_server_uses_core_canonical_c4d_type():
     assert from_env.call_args.args[0] == "c4d"
 
 
+def test_server_discovers_adapter_skills_under_c4d():
+    server = Cinema4dMcpServer(port=0)
+    server.register_builtin_actions()
+
+    names = {skill["name"] for skill in server.list_skills()}
+
+    assert {"cinema4d-modeling", "cinema4d-session"}.issubset(names)
+    assert server.load_skill("cinema4d-session") is True
+    assert server.load_skill("cinema4d-modeling") is True
+
+
 def test_skill_contracts_are_complete_and_bounded():
     names = set()
     for tools_path in SKILLS.glob("*/tools.yaml"):
