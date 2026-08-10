@@ -1,0 +1,140 @@
+tools:
+  - name: add_primitive
+    description: Add a typed cube, sphere, cylinder, cone, torus, or plane with an absolute transform.
+    source_file: scripts/add_primitive.py
+    input_schema:
+      type: object
+      required: [document_path, primitive, name, dimensions]
+      properties:
+        document_path: {type: string, minLength: 1, maxLength: 4096}
+        primitive: {type: string, enum: [cone, cube, cylinder, plane, sphere, torus]}
+        name: {type: string, minLength: 1, maxLength: 128}
+        dimensions:
+          type: object
+          minProperties: 1
+          properties:
+            size: {type: array, minItems: 3, maxItems: 3, items: {type: number, exclusiveMinimum: 0}}
+            radius: {type: number, exclusiveMinimum: 0}
+            height: {type: number, exclusiveMinimum: 0}
+            width: {type: number, exclusiveMinimum: 0}
+            bottom_radius: {type: number, minimum: 0}
+            top_radius: {type: number, minimum: 0}
+            ring_radius: {type: number, exclusiveMinimum: 0}
+            pipe_radius: {type: number, exclusiveMinimum: 0}
+          additionalProperties: false
+        translation: {type: array, minItems: 3, maxItems: 3, items: {type: number}, default: [0, 0, 0]}
+        rotation_hpb_degrees: {type: array, minItems: 3, maxItems: 3, items: {type: number}, default: [0, 0, 0]}
+        scale: {type: array, minItems: 3, maxItems: 3, items: {type: number, exclusiveMinimum: 0}, default: [1, 1, 1]}
+        timeout_secs: {type: number, minimum: 1, maximum: 1800, default: 120}
+      additionalProperties: false
+    output_schema: {type: object}
+    execution: async
+    job_strategy: monolithic
+    affinity: any
+    enforce_thread_affinity: true
+    timeout_hint_secs: 1800
+    annotations: {read_only_hint: false, destructive_hint: false, idempotent_hint: false, open_world_hint: false, deferred_hint: true}
+    next-tools: {on-success: [inspect_document, validate_document], on-failure: [inspect_document]}
+
+  - name: transform_object
+    description: Set one uniquely named object's absolute translation, HPB rotation, and scale.
+    source_file: scripts/transform_object.py
+    input_schema:
+      type: object
+      required: [document_path, object_name, translation]
+      properties:
+        document_path: {type: string, minLength: 1, maxLength: 4096}
+        object_name: {type: string, minLength: 1, maxLength: 128}
+        translation: {type: array, minItems: 3, maxItems: 3, items: {type: number}}
+        rotation_hpb_degrees: {type: array, minItems: 3, maxItems: 3, items: {type: number}, default: [0, 0, 0]}
+        scale: {type: array, minItems: 3, maxItems: 3, items: {type: number, exclusiveMinimum: 0}, default: [1, 1, 1]}
+        timeout_secs: {type: number, minimum: 1, maximum: 1800, default: 120}
+      additionalProperties: false
+    output_schema: {type: object}
+    execution: async
+    job_strategy: monolithic
+    affinity: any
+    enforce_thread_affinity: true
+    timeout_hint_secs: 1800
+    annotations: {read_only_hint: false, destructive_hint: false, idempotent_hint: true, open_world_hint: false, deferred_hint: true}
+
+  - name: remove_object
+    description: Remove one uniquely named object, refusing child removal unless cascade is explicit.
+    source_file: scripts/remove_object.py
+    input_schema:
+      type: object
+      required: [document_path, object_name]
+      properties:
+        document_path: {type: string, minLength: 1, maxLength: 4096}
+        object_name: {type: string, minLength: 1, maxLength: 128}
+        cascade: {type: boolean, default: false}
+        timeout_secs: {type: number, minimum: 1, maximum: 1800, default: 120}
+      additionalProperties: false
+    output_schema: {type: object}
+    execution: async
+    job_strategy: monolithic
+    affinity: any
+    enforce_thread_affinity: true
+    timeout_hint_secs: 1800
+    annotations: {read_only_hint: false, destructive_hint: true, idempotent_hint: false, open_world_hint: false, deferred_hint: true}
+
+  - name: import_geometry
+    description: Merge geometry through a runtime-provided importer; OBJ is the validated baseline.
+    source_file: scripts/import_geometry.py
+    input_schema:
+      type: object
+      required: [document_path, input_path]
+      properties:
+        document_path: {type: string, minLength: 1, maxLength: 4096}
+        input_path: {type: string, minLength: 1, maxLength: 4096}
+        timeout_secs: {type: number, minimum: 1, maximum: 1800, default: 600}
+      additionalProperties: false
+    output_schema: {type: object}
+    execution: async
+    job_strategy: monolithic
+    affinity: any
+    enforce_thread_affinity: true
+    timeout_hint_secs: 1800
+    annotations: {read_only_hint: false, destructive_hint: false, idempotent_hint: false, open_world_hint: false, deferred_hint: true}
+
+  - name: export_document
+    description: Export through a runtime-provided exporter; OBJ is the validated baseline.
+    source_file: scripts/export_document.py
+    input_schema:
+      type: object
+      required: [document_path, output_path]
+      properties:
+        document_path: {type: string, minLength: 1, maxLength: 4096}
+        output_path: {type: string, minLength: 1, maxLength: 4096}
+        overwrite: {type: boolean, default: false}
+        timeout_secs: {type: number, minimum: 1, maximum: 1800, default: 600}
+      additionalProperties: false
+    output_schema: {type: object}
+    execution: async
+    job_strategy: monolithic
+    affinity: any
+    enforce_thread_affinity: true
+    timeout_hint_secs: 1800
+    annotations: {read_only_hint: false, destructive_hint: true, idempotent_hint: false, open_world_hint: false, deferred_hint: true}
+
+  - name: render_document
+    description: Render a C4D document headlessly to a bounded PNG or JPEG image.
+    source_file: scripts/render_document.py
+    input_schema:
+      type: object
+      required: [document_path, output_path]
+      properties:
+        document_path: {type: string, minLength: 1, maxLength: 4096}
+        output_path: {type: string, minLength: 1, maxLength: 4096}
+        width: {type: integer, minimum: 1, maximum: 8192, default: 640}
+        height: {type: integer, minimum: 1, maximum: 8192, default: 480}
+        overwrite: {type: boolean, default: false}
+        timeout_secs: {type: number, minimum: 1, maximum: 1800, default: 1200}
+      additionalProperties: false
+    output_schema: {type: object}
+    execution: async
+    job_strategy: monolithic
+    affinity: any
+    enforce_thread_affinity: true
+    timeout_hint_secs: 1800
+    annotations: {read_only_hint: false, destructive_hint: true, idempotent_hint: false, open_world_hint: false, deferred_hint: true}

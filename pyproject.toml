@@ -5,15 +5,32 @@ build-backend="hatchling.build"
 [project]
 name="dcc-mcp-cinema4d"
 version="0.1.0"
-description="Cinema 4D adapter foundation for DCC-MCP"
+description="Production Cinema 4D adapter for typed headless modeling, interchange, inspection, and rendering"
 readme="README.md"
 requires-python=">=3.9"
 license={text="MIT"}
 authors=[{name="loonghao",email="hal.long@outlook.com"}]
-dependencies=["dcc-mcp-core>=0.19.45,<1.0.0"]
+keywords=["cinema4d","c4dpy","3d","dcc","mcp","automation"]
+classifiers=[
+  "Development Status :: 4 - Beta",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Operating System :: OS Independent",
+]
+dependencies=["dcc-mcp-core>=0.19.91,<1.0.0"]
+
+[project.urls]
+Homepage="https://github.com/dcc-mcp/dcc-mcp-cinema4d"
+Repository="https://github.com/dcc-mcp/dcc-mcp-cinema4d"
+Issues="https://github.com/dcc-mcp/dcc-mcp-cinema4d/issues"
 
 [project.optional-dependencies]
-test=["pytest>=8","ruff>=0.8"]
+test=["pytest>=8","ruff>=0.8","PyYAML>=6"]
+dev=["pytest>=8","ruff>=0.8","PyYAML>=6","build>=1.2","twine>=6"]
 
 [project.scripts]
 dcc-mcp-cinema4d="dcc_mcp_cinema4d.server:main"
@@ -28,6 +45,11 @@ artifacts=["src/dcc_mcp_cinema4d/skills/**"]
 [tool.pytest.ini_options]
 testpaths=["tests"]
 pythonpath=["src","."]
+markers=["cinema4d: requires a real licensed c4dpy runtime"]
 
 [tool.ruff.lint]
 select=["E","F","I","B"]
+
+[tool.ruff]
+line-length=100
+target-version="py39"

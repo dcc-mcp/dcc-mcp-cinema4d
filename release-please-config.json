@@ -1,2 +1,16 @@
-{"release-type":"python","package-name":"dcc-mcp-cinema4d","include-component-in-tag":true}
-
+{
+  "packages": {
+    ".": {
+      "release-type": "python",
+      "package-name": "dcc-mcp-cinema4d",
+      "changelog-path": "CHANGELOG.md",
+      "include-component-in-tag": false,
+      "extra-files": [
+        {"type": "toml", "path": "pyproject.toml", "jsonpath": "$.project.version"},
+        {"type": "generic", "path": "src/dcc_mcp_cinema4d/__version__.py"},
+        {"type": "generic", "path": "src/dcc_mcp_cinema4d/skills/cinema4d-session/SKILL.md"},
+        {"type": "generic", "path": "src/dcc_mcp_cinema4d/skills/cinema4d-modeling/SKILL.md"}
+      ]
+    }
+  }
+}
