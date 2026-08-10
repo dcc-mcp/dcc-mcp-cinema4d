@@ -10,7 +10,7 @@ metadata:
   dcc-mcp:
     dcc: c4d
     layer: domain
-    version: "0.1.1"  # x-release-please-version
+    version: "0.1.2"  # x-release-please-version
     tags: "cinema4d,modeling,import,export,render"
     tools: tools.yaml
     depends: ["cinema4d-session", "dcc-diagnostics"]
