@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.2](https://github.com/dcc-mcp/dcc-mcp-cinema4d/compare/v0.1.1...v0.1.2) (2026-08-10)
+
+
+### Bug Fixes
+
+* align Cinema 4D with canonical c4d type ([#5](https://github.com/dcc-mcp/dcc-mcp-cinema4d/issues/5)) ([ab580a4](https://github.com/dcc-mcp/dcc-mcp-cinema4d/commit/ab580a4613b9143a5cae220eaaf51391229090cb))
+* restore Cinema 4D skill routing ([#7](https://github.com/dcc-mcp/dcc-mcp-cinema4d/issues/7)) ([ee7e9b6](https://github.com/dcc-mcp/dcc-mcp-cinema4d/commit/ee7e9b6adab15de0c6ba0e3e562b851cf436c7a3))
+
 ## [0.1.1](https://github.com/dcc-mcp/dcc-mcp-cinema4d/compare/v0.1.0...v0.1.1) (2026-08-10)
 
 
