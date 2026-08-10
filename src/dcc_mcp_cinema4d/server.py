@@ -16,7 +16,7 @@ _server: Optional["Cinema4dMcpServer"] = None
 class Cinema4dMcpServer(DccServerBase):
     def __init__(self, port: Optional[int] = None):
         options = DccServerOptions.from_env(
-            "cinema4d",
+            "c4d",
             Path(__file__).parent / "skills",
             port=port,
             server_name="dcc-mcp-cinema4d",

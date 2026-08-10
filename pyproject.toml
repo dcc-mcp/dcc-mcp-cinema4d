@@ -36,6 +36,7 @@ dev=["pytest>=8","ruff>=0.8","PyYAML>=6","build>=1.2","twine>=6"]
 dcc-mcp-cinema4d="dcc_mcp_cinema4d.server:main"
 
 [project.entry-points."dcc_mcp.adapters"]
+c4d="dcc_mcp_cinema4d:Cinema4dMcpServer"
 cinema4d="dcc_mcp_cinema4d:Cinema4dMcpServer"
 
 [tool.hatch.build.targets.wheel]
