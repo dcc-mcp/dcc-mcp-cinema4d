@@ -1,4 +1,4 @@
 # Dependencies
 
-- `cinema4d-session`
-- `dcc-diagnostics`
+- cinema4d-session
+- dcc-diagnostics

@@ -8,12 +8,12 @@ compatibility: "Cinema 4D R21+ with licensed c4dpy; dcc-mcp-core 0.19.91+"
 allowed-tools: "python"
 metadata:
   dcc-mcp:
-    dcc: cinema4d
+    dcc: c4d
     layer: domain
     version: "0.1.1"  # x-release-please-version
     tags: "cinema4d,modeling,import,export,render"
     tools: tools.yaml
-    depends: "cinema4d-session,dcc-diagnostics"
+    depends: ["cinema4d-session", "dcc-diagnostics"]
 ---
 
 # Cinema 4D modeling
