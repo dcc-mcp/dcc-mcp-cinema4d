@@ -7,6 +7,10 @@
 Typed Cinema 4D document automation for DCC-MCP, executed through Maxon's licensed
 headless `c4dpy` runtime.
 
+![Typed primitives assembled, validated, rendered, and prepared for interchange through Cinema 4D](docs/images/dcc-mcp-cinema4d-showcase.webp)
+
+_Illustrative workflow limited to the adapter's implemented primitive, transform, validation, render, and interchange operations; generated source is retained in `docs/images/dcc-mcp-cinema4d-showcase-source.png`._
+
 ## Capabilities
 
 - Discover and report the real Cinema 4D, Python, and API versions.
