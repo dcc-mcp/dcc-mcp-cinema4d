@@ -43,6 +43,9 @@ cinema4d="dcc_mcp_cinema4d:Cinema4dMcpServer"
 packages=["src/dcc_mcp_cinema4d"]
 artifacts=["src/dcc_mcp_cinema4d/skills/**"]
 
+[tool.hatch.build.targets.sdist]
+exclude=["docs/**/*.png", "docs/**/*.svg", "docs/**/*.webp"]
+
 [tool.pytest.ini_options]
 testpaths=["tests"]
 pythonpath=["src","."]
