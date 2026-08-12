@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.3](https://github.com/dcc-mcp/dcc-mcp-cinema4d/compare/v0.1.2...v0.1.3) (2026-08-12)
+
+
+### Documentation
+
+* add typed scene showcase ([#8](https://github.com/dcc-mcp/dcc-mcp-cinema4d/issues/8)) ([fe9e46c](https://github.com/dcc-mcp/dcc-mcp-cinema4d/commit/fe9e46cb89c2030d6759e998bdc688fd626ee9c2))
+* publish approved Cinema 4D showcase ([#10](https://github.com/dcc-mcp/dcc-mcp-cinema4d/issues/10)) ([79db2c2](https://github.com/dcc-mcp/dcc-mcp-cinema4d/commit/79db2c208e6afb64b9b914f85b3c439e183b741f))
+
 ## [0.1.2](https://github.com/dcc-mcp/dcc-mcp-cinema4d/compare/v0.1.1...v0.1.2) (2026-08-10)
 
 
