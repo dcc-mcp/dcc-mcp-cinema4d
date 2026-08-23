@@ -394,7 +394,7 @@ class Cinema4dBridge:
             if staged.exists():
                 staged.unlink()
 
-    def status(self) -> dict[str, Any]:
+    def status(self, timeout_secs: float = 60) -> dict[str, Any]:
         if not self.executable:
             return {
                 "ready": False,
@@ -403,7 +403,7 @@ class Cinema4dBridge:
                 "reason": "c4dpy_not_found",
                 "allowed_roots": [str(root) for root in self.allowed_roots],
             }
-        result = self._invoke("system.status", {}, 60)
+        result = self._invoke("system.status", {}, timeout_secs)
         result.update(
             {
                 "ready": True,
