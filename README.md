@@ -44,8 +44,12 @@ and license.
 
 ## Install
 
+See [`install.md`](install.md) for the wheel-only agent path, platform
+discovery, JSON doctor contract, upgrade, uninstall, and troubleshooting.
+
 ```bash
 python -m pip install dcc-mcp-cinema4d
+dcc-mcp-cinema4d doctor --json
 ```
 
 Set the licensed runtime and allowed workspace before starting the adapter:
@@ -54,6 +58,12 @@ Set the licensed runtime and allowed workspace before starting the adapter:
 $env:DCC_MCP_CINEMA4D_C4DPY = "C:\Program Files\Maxon Cinema 4D 2026\c4dpy.exe"
 $env:DCC_MCP_CINEMA4D_ALLOWED_ROOTS = "D:\projects;D:\exports"
 dcc-mcp-cinema4d
+```
+
+For an explicit standalone readiness check:
+
+```powershell
+dcc-mcp-cinema4d verify --c4dpy "C:\Program Files\Maxon Cinema 4D 2026\c4dpy.exe" --json
 ```
 
 `c4dpy` is also discovered from `PATH` and common Maxon installation folders. The default
