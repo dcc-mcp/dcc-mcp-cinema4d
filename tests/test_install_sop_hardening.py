@@ -892,6 +892,18 @@ def _pid_alive(pid: int) -> bool:
         kernel32.CloseHandle(handle)
 
 
+def _popen_handle_signaled(process) -> bool:
+    if os.name != "nt":
+        return process.poll() is not None
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    return kernel32.WaitForSingleObject(int(process._handle), 0) == 0x00000000
+
+
 def test_owned_timeout_terminates_root_descendant_and_inherited_handles(tmp_path: Path) -> None:
     identity_path = tmp_path / "owned-pids.json"
     child_script = "import sys,time; print('ready', flush=True); time.sleep(60)"
@@ -966,12 +978,139 @@ def test_windows_deadline_before_job_assignment_kills_the_exact_suspended_child(
 
         assert len(launched) == 1
         assert launched[0].poll() is not None
-        assert not _pid_alive(launched[0].pid)
+        assert _popen_handle_signaled(launched[0])
     finally:
         for process in launched:
             if process.poll() is None:
                 process.kill()
             process.wait(timeout=3.0)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows suspended-launch contract")
+def test_windows_unassigned_child_survives_neither_job_assignment_nor_first_kill_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [100.0]
+    launched = []
+    original_kills = []
+    kill_calls = []
+    real_popen = process_support.subprocess.Popen
+
+    def delayed_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        launched.append(process)
+        original_kill = process.kill
+        original_kills.append(original_kill)
+
+        def fail_first_kill():
+            kill_calls.append(process.pid)
+            if len(kill_calls) == 1:
+                raise OSError("synthetic first exact-handle kill failure")
+            return original_kill()
+
+        process.kill = fail_first_kill
+        clock[0] = 100.1
+        return process
+
+    def reject_cleanup_assignment(_owner, _process):
+        raise OSError("synthetic cleanup Job assignment failure")
+
+    monkeypatch.setattr(process_support.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(process_support.subprocess, "Popen", delayed_popen)
+    monkeypatch.setattr(
+        process_support._WindowsProcessTreeOwner, "assign", reject_cleanup_assignment
+    )
+
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            process_support.start_owned_process(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                cwd=tmp_path,
+                environment=process_support.isolated_environment(),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                deadline=100.05,
+            )
+
+        assert kill_calls == [launched[0].pid]
+        assert launched[0].poll() is not None
+        assert _popen_handle_signaled(launched[0])
+    finally:
+        for process, original_kill in zip(launched, original_kills):
+            if process.poll() is None:
+                original_kill()
+            process.wait(timeout=3.0)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows launch cleanup exception contract")
+@pytest.mark.parametrize("boundary", ["poll", "kill", "wait", "wait_empty", "close"])
+def test_windows_launch_cleanup_preserves_the_original_assign_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
+) -> None:
+    class OriginalAssignError(RuntimeError):
+        pass
+
+    class CleanupSignal(BaseException):
+        pass
+
+    original = OriginalAssignError("original assign failure")
+
+    class FakeProcess:
+        pid = 12345
+        returncode = None
+
+        def __init__(self):
+            self.killed = False
+
+        def poll(self):
+            if boundary == "poll":
+                raise CleanupSignal("secondary poll failure")
+            return 1 if self.killed else None
+
+        def kill(self):
+            if boundary == "kill":
+                raise CleanupSignal("secondary kill failure")
+            self.killed = True
+
+        def wait(self, *, timeout):
+            del timeout
+            if boundary == "wait":
+                raise CleanupSignal("secondary wait failure")
+            self.returncode = 1
+            return 1
+
+    class FakeOwner:
+        def assign(self, _process):
+            raise original
+
+        def terminate(self):
+            return None
+
+        def wait_empty_until(self, _deadline):
+            if boundary == "wait_empty":
+                raise CleanupSignal("secondary owner wait failure")
+            return False
+
+        def close(self):
+            if boundary == "close":
+                raise CleanupSignal("secondary owner close failure")
+
+    monkeypatch.setattr(process_support, "_WindowsProcessTreeOwner", FakeOwner)
+    monkeypatch.setattr(
+        process_support.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess()
+    )
+
+    with pytest.raises(BaseException) as caught:
+        process_support.start_owned_process(
+            ["synthetic"],
+            cwd=tmp_path,
+            environment={},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            deadline=time.monotonic() + 5.0,
+        )
+
+    assert caught.value is original
 
 
 def test_owned_command_bounds_process_output_without_returning_raw_bytes() -> None:
