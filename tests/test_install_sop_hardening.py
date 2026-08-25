@@ -438,7 +438,23 @@ def test_macos_process_group_ignores_zombies_from_bounded_ps(
     assert process_support._darwin_group_has_live_members(12345) is False
     assert observed
     assert observed[0][0] == [str(fake_ps), "-axo", "pid=,pgid=,sid=,state="]
-    assert 0 < observed[0][1] <= 3.0
+    assert observed[0][1] > 0
+    assert observed[0][1] == pytest.approx(3.0)
+
+
+def test_macos_process_group_preserves_a_partially_consumed_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_ps, observed = _fake_darwin_ps(
+        tmp_path,
+        monkeypatch,
+        stdout="24680 12345 12345 Z\n",
+    )
+    ticks = iter((100.0, 100.75))
+    monkeypatch.setattr(process_support.time, "monotonic", lambda: next(ticks))
+
+    assert process_support._darwin_group_has_live_members(12345) is False
+    assert observed == [([str(fake_ps), "-axo", "pid=,pgid=,sid=,state="], pytest.approx(2.25))]
 
 
 def test_runtime_ready_receipt_rejects_a_foreign_or_forged_pid(
