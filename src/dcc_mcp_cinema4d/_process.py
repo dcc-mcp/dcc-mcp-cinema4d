@@ -134,6 +134,7 @@ class _PosixProcessTreeOwner(_ProcessTreeOwner):
 def _darwin_group_has_live_members(process_group: int) -> bool:
     """Distinguish live group members from launchd-owned zombies on macOS."""
     import ctypes
+    import errno
 
     class ProcBsdInfo(ctypes.Structure):
         _fields_ = [
@@ -162,7 +163,7 @@ def _darwin_group_has_live_members(process_group: int) -> bool:
         ]
 
     try:
-        libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
         libproc.proc_listpids.argtypes = [
             ctypes.c_uint32,
             ctypes.c_uint32,
@@ -179,19 +180,24 @@ def _darwin_group_has_live_members(process_group: int) -> bool:
         ]
         libproc.proc_pidinfo.restype = ctypes.c_int
         pids = (ctypes.c_int * 4096)()
+        ctypes.set_errno(0)
         used = libproc.proc_listpids(2, process_group, pids, ctypes.sizeof(pids))
         if used < 0:
             return True
         if used == 0:
-            return False
+            return ctypes.get_errno() != 0
         for pid in pids[: used // ctypes.sizeof(ctypes.c_int)]:
             if pid <= 0:
                 continue
             info = ProcBsdInfo()
-            if libproc.proc_pidinfo(
-                pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)
-            ) != ctypes.sizeof(info):
+            ctypes.set_errno(0)
+            captured = libproc.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
+            if captured != ctypes.sizeof(info):
+                if captured == 0 and ctypes.get_errno() == errno.ESRCH:
+                    continue
                 return True
+            if int(info.pbi_pid) != pid or int(info.pbi_pgid) != process_group:
+                continue
             if int(info.pbi_status) != 5:
                 return True
         return False

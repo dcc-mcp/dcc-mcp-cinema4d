@@ -328,9 +328,75 @@ def test_macos_process_group_listing_distinguishes_empty_from_error(
         proc_listpids = FakeFunction(listed_bytes)
         proc_pidinfo = FakeFunction(-1)
 
-    monkeypatch.setattr(ctypes, "CDLL", lambda _path: FakeLibproc())
+    monkeypatch.setattr(ctypes, "CDLL", lambda _path, **_kwargs: FakeLibproc())
 
     assert process_support._darwin_group_has_live_members(12345) is expected
+
+
+def test_macos_process_group_ignores_a_member_gone_before_recapture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ctypes
+    import errno
+
+    class FakeFunction:
+        def __init__(self, callback) -> None:
+            self.callback = callback
+            self.argtypes = None
+            self.restype = None
+
+        def __call__(self, *args: object) -> int:
+            return int(self.callback(*args))
+
+    def list_one(_kind, _group, pids, _size) -> int:
+        pids[0] = 24680
+        return ctypes.sizeof(ctypes.c_int)
+
+    def gone_before_info(_pid, _flavor, _arg, _info, _size) -> int:
+        ctypes.set_errno(errno.ESRCH)
+        return 0
+
+    class FakeLibproc:
+        proc_listpids = FakeFunction(list_one)
+        proc_pidinfo = FakeFunction(gone_before_info)
+
+    monkeypatch.setattr(ctypes, "CDLL", lambda _path, **_kwargs: FakeLibproc())
+
+    assert process_support._darwin_group_has_live_members(12345) is False
+
+
+def test_macos_process_group_rejects_a_reused_foreign_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ctypes
+
+    class FakeFunction:
+        def __init__(self, callback) -> None:
+            self.callback = callback
+            self.argtypes = None
+            self.restype = None
+
+        def __call__(self, *args: object) -> int:
+            return int(self.callback(*args))
+
+    def list_one(_kind, _group, pids, _size) -> int:
+        pids[0] = 24680
+        return ctypes.sizeof(ctypes.c_int)
+
+    def recapture_foreign(pid, _flavor, _arg, info_pointer, size) -> int:
+        info = info_pointer._obj
+        info.pbi_pid = pid
+        info.pbi_pgid = 54321
+        info.pbi_status = 2
+        return size
+
+    class FakeLibproc:
+        proc_listpids = FakeFunction(list_one)
+        proc_pidinfo = FakeFunction(recapture_foreign)
+
+    monkeypatch.setattr(ctypes, "CDLL", lambda _path, **_kwargs: FakeLibproc())
+
+    assert process_support._darwin_group_has_live_members(12345) is False
 
 
 def test_runtime_ready_receipt_rejects_a_foreign_or_forged_pid(
