@@ -88,7 +88,7 @@ class _ProcessTreeOwner:
         return self.wait_empty_until(time.monotonic() + max(0.0, timeout))
 
     def wait_empty_until(self, deadline: float) -> bool:
-        return True
+        return time.monotonic() < deadline
 
     def close(self) -> None:
         return None
@@ -118,15 +118,18 @@ class _PosixProcessTreeOwner(_ProcessTreeOwner):
 
     def wait_empty_until(self, deadline: float) -> bool:
         while True:
+            if time.monotonic() >= deadline:
+                return False
             if sys.platform == "darwin":
-                remaining = max(0.0, deadline - time.monotonic())
-                if not _darwin_group_has_live_members(self.process.pid, remaining):
+                if not _darwin_group_has_live_members(self.process.pid, deadline):
+                    if time.monotonic() >= deadline:
+                        return False
                     # Keep the killed leader unreaped until the group has been
                     # proven to contain no live member.  This prevents its
                     # numeric PID/process-group identity from being reused
                     # during the accounting window.
                     self.process.poll()
-                    return True
+                    return time.monotonic() < deadline
                 if time.monotonic() >= deadline:
                     return False
                 time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
@@ -134,8 +137,10 @@ class _PosixProcessTreeOwner(_ProcessTreeOwner):
             try:
                 os.killpg(self.process.pid, 0)
             except ProcessLookupError:
+                if time.monotonic() >= deadline:
+                    return False
                 self.process.poll()
-                return True
+                return time.monotonic() < deadline
             except PermissionError:
                 return False
             # Reap the supervisor before probing its process group.  A dead
@@ -154,10 +159,14 @@ class _PosixProcessTreeOwner(_ProcessTreeOwner):
             return False
 
 
-def _darwin_group_has_live_members(process_group: int, timeout: float = _CLEANUP_SECS) -> bool:
+def _darwin_group_has_live_members(process_group: int, deadline: float) -> bool:
     """Distinguish live group members from launchd-owned zombies on macOS."""
-    deadline = time.monotonic() + min(_CLEANUP_SECS, max(0.0, float(timeout)))
+    deadline = float(deadline)
+    if time.monotonic() >= deadline:
+        return True
     ps_path = next((path for path in _DARWIN_PS_PATHS if path.is_file()), None)
+    if time.monotonic() >= deadline:
+        return True
     if ps_path is None:
         return True
     observed = None
@@ -178,12 +187,16 @@ def _darwin_group_has_live_members(process_group: int, timeout: float = _CLEANUP
             )
         except (OSError, subprocess.TimeoutExpired):
             return True
+        if time.monotonic() >= deadline:
+            return True
         if candidate.returncode == 0:
             observed = candidate
             break
     if observed is None:
         return True
     for line in observed.stdout.splitlines():
+        if time.monotonic() >= deadline:
+            return True
         fields = line.split()
         if len(fields) != 4:
             return True
@@ -195,8 +208,10 @@ def _darwin_group_has_live_members(process_group: int, timeout: float = _CLEANUP
         if (
             observed_group == process_group or observed_session == process_group
         ) and not state.startswith("Z"):
+            if time.monotonic() >= deadline:
+                return True
             return True
-    return False
+    return time.monotonic() >= deadline
 
 
 class _WindowsProcessTreeOwner(_ProcessTreeOwner):
@@ -322,6 +337,8 @@ class _WindowsProcessTreeOwner(_ProcessTreeOwner):
             raise OSError(self._ctypes.get_last_error(), "TerminateJobObject failed")
 
     def wait_empty_until(self, deadline: float) -> bool:
+        if time.monotonic() >= deadline:
+            return False
         while self._handle:
             accounting = self._accounting_type()
             if not self._kernel32.QueryInformationJobObject(
@@ -332,12 +349,14 @@ class _WindowsProcessTreeOwner(_ProcessTreeOwner):
                 None,
             ):
                 return False
+            if time.monotonic() >= deadline:
+                return False
             if accounting.ActiveProcesses == 0:
                 return True
             if time.monotonic() >= deadline:
                 return False
             time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
-        return True
+        return time.monotonic() < deadline
 
     def close(self) -> None:
         if self._handle:
@@ -456,7 +475,7 @@ class OwnedProcess:
         return self.owner.wait_pid_exit_until(pid, deadline)
 
     def close(self, *, deadline: float) -> None:
-        cleanup_failed = False
+        cleanup_failed = time.monotonic() >= deadline
         try:
             try:
                 self.owner.terminate()
@@ -490,6 +509,7 @@ class OwnedProcess:
                 self.owner.close()
             except BaseException:
                 cleanup_failed = True
+        cleanup_failed = cleanup_failed or time.monotonic() >= deadline
         if cleanup_failed:
             raise ProcessCleanupError("owned process-tree cleanup could not be verified")
 
