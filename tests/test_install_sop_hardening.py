@@ -309,122 +309,135 @@ def test_macos_runtime_identity_uses_kernel_microseconds() -> None:
     assert identity["executable_file_identity"]
 
 
-@pytest.mark.parametrize(("listed_bytes", "expected"), [(0, False), (-1, True)])
-def test_macos_process_group_listing_distinguishes_empty_from_error(
-    monkeypatch: pytest.MonkeyPatch, listed_bytes: int, expected: bool
+def _fake_darwin_ps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    stdout: str,
+    returncode: int = 0,
+):
+    fake_ps = tmp_path / "ps"
+    fake_ps.write_bytes(b"")
+    observed: list[tuple[list[str], float]] = []
+
+    def fake_run(command, **kwargs):
+        observed.append((list(command), float(kwargs["timeout"])))
+        return subprocess.CompletedProcess(command, returncode, stdout, "")
+
+    monkeypatch.setattr(process_support, "_DARWIN_PS_PATHS", (fake_ps,))
+    monkeypatch.setattr(process_support.subprocess, "run", fake_run)
+    return fake_ps, observed
+
+
+@pytest.mark.parametrize(
+    ("stdout", "returncode", "expected"),
+    [
+        ("", 0, False),
+        ("24680 12345 12345 R\n", 0, True),
+        ("24680 54321 12345 R\n", 0, True),
+        ("24680 54321 54321 R\n", 0, False),
+        ("24680 12345 12345 Z\n", 0, False),
+        ("malformed\n", 0, True),
+        ("", 1, True),
+    ],
+)
+def test_macos_process_group_accounting_is_exact_and_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: str,
+    returncode: int,
+    expected: bool,
 ) -> None:
-    import ctypes
-
-    class FakeFunction:
-        def __init__(self, result: int) -> None:
-            self.result = result
-            self.argtypes = None
-            self.restype = None
-
-        def __call__(self, *_args: object) -> int:
-            return self.result
-
-    class FakeLibproc:
-        proc_listpids = FakeFunction(listed_bytes)
-        proc_pidinfo = FakeFunction(-1)
-
-    monkeypatch.setattr(ctypes, "CDLL", lambda _path, **_kwargs: FakeLibproc())
+    _fake_darwin_ps(
+        tmp_path,
+        monkeypatch,
+        stdout=stdout,
+        returncode=returncode,
+    )
 
     assert process_support._darwin_group_has_live_members(12345) is expected
 
 
-def test_macos_missing_process_group_is_not_reported_as_live(
-    monkeypatch: pytest.MonkeyPatch,
+def test_macos_process_group_timeout_is_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import ctypes
-    import errno
+    fake_ps = tmp_path / "ps"
+    fake_ps.write_bytes(b"")
 
-    class FakeFunction:
-        def __init__(self, callback) -> None:
-            self.callback = callback
-            self.argtypes = None
-            self.restype = None
+    def fake_run(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
 
-        def __call__(self, *args: object) -> int:
-            return int(self.callback(*args))
+    monkeypatch.setattr(process_support, "_DARWIN_PS_PATHS", (fake_ps,))
+    monkeypatch.setattr(process_support.subprocess, "run", fake_run)
 
-    def missing_group(*_args: object) -> int:
-        ctypes.set_errno(errno.ESRCH)
-        return 0
+    assert process_support._darwin_group_has_live_members(12345, 0.05) is True
 
-    class FakeLibproc:
-        proc_listpids = FakeFunction(missing_group)
-        proc_pidinfo = FakeFunction(lambda *_args: -1)
 
-    monkeypatch.setattr(ctypes, "CDLL", lambda _path, **_kwargs: FakeLibproc())
+def test_macos_process_group_falls_back_to_the_sess_column(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_ps = tmp_path / "ps"
+    fake_ps.write_bytes(b"")
+    observed: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        observed.append(list(command))
+        returncode = 1 if "pid=,pgid=,sid=,state=" in command else 0
+        return subprocess.CompletedProcess(command, returncode, "", "")
+
+    monkeypatch.setattr(process_support, "_DARWIN_PS_PATHS", (fake_ps,))
+    monkeypatch.setattr(process_support.subprocess, "run", fake_run)
 
     assert process_support._darwin_group_has_live_members(12345) is False
+    assert observed == [
+        [str(fake_ps), "-axo", "pid=,pgid=,sid=,state="],
+        [str(fake_ps), "-axo", "pid=,pgid=,sess=,state="],
+    ]
 
 
-def test_macos_process_group_ignores_a_member_gone_before_recapture(
+def test_macos_wait_empty_retains_the_leader_until_group_accounting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import ctypes
-    import errno
+    events: list[str] = []
 
-    class FakeFunction:
-        def __init__(self, callback) -> None:
-            self.callback = callback
-            self.argtypes = None
-            self.restype = None
+    class FakeProcess:
+        pid = 12345
 
-        def __call__(self, *args: object) -> int:
-            return int(self.callback(*args))
+        def poll(self):
+            events.append("reap")
+            return -9
 
-    def list_one(_kind, _group, pids, _size) -> int:
-        pids[0] = 24680
-        return ctypes.sizeof(ctypes.c_int)
+    owner = process_support._PosixProcessTreeOwner(FakeProcess())
+    monkeypatch.setattr(process_support.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        process_support.os,
+        "killpg",
+        lambda _group, _signal: (_ for _ in ()).throw(OSError("signal-zero unavailable")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        process_support,
+        "_darwin_group_has_live_members",
+        lambda _group, _timeout: events.append("account") or False,
+    )
 
-    def gone_before_info(_pid, _flavor, _arg, _info, _size) -> int:
-        ctypes.set_errno(errno.ESRCH)
-        return 0
-
-    class FakeLibproc:
-        proc_listpids = FakeFunction(list_one)
-        proc_pidinfo = FakeFunction(gone_before_info)
-
-    monkeypatch.setattr(ctypes, "CDLL", lambda _path, **_kwargs: FakeLibproc())
-
-    assert process_support._darwin_group_has_live_members(12345) is False
+    assert owner.wait_empty(0.1) is True
+    assert events == ["account", "reap"]
 
 
-def test_macos_process_group_rejects_a_reused_foreign_pid(
-    monkeypatch: pytest.MonkeyPatch,
+def test_macos_process_group_ignores_zombies_from_bounded_ps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import ctypes
-
-    class FakeFunction:
-        def __init__(self, callback) -> None:
-            self.callback = callback
-            self.argtypes = None
-            self.restype = None
-
-        def __call__(self, *args: object) -> int:
-            return int(self.callback(*args))
-
-    def list_one(_kind, _group, pids, _size) -> int:
-        pids[0] = 24680
-        return ctypes.sizeof(ctypes.c_int)
-
-    def recapture_foreign(pid, _flavor, _arg, info_pointer, size) -> int:
-        info = info_pointer._obj
-        info.pbi_pid = pid
-        info.pbi_pgid = 54321
-        info.pbi_status = 2
-        return size
-
-    class FakeLibproc:
-        proc_listpids = FakeFunction(list_one)
-        proc_pidinfo = FakeFunction(recapture_foreign)
-
-    monkeypatch.setattr(ctypes, "CDLL", lambda _path, **_kwargs: FakeLibproc())
+    fake_ps, observed = _fake_darwin_ps(
+        tmp_path,
+        monkeypatch,
+        stdout="24680 12345 12345 Z\n",
+    )
 
     assert process_support._darwin_group_has_live_members(12345) is False
+    assert observed
+    assert observed[0][0] == [str(fake_ps), "-axo", "pid=,pgid=,sid=,state="]
+    assert 0 < observed[0][1] <= 3.0
 
 
 def test_runtime_ready_receipt_rejects_a_foreign_or_forged_pid(
