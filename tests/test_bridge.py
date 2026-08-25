@@ -1,4 +1,5 @@
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -152,6 +153,33 @@ def test_bridge_waits_when_executable_launches_worker_and_exits(tmp_path, monkey
 
     with pytest.raises(BridgeError, match="Cinema 4D operation failed"):
         bridge._invoke("unsafe.eval", {}, 10)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX orphan-reaping contract")
+def test_bridge_allows_acknowledged_runtime_to_exit_before_cleanup(tmp_path, monkeypatch):
+    _accept_synthetic_runtime_identity(monkeypatch)
+    exited = tmp_path / "runtime-exited"
+    driver = tmp_path / "delayed-exit-driver.py"
+    driver.write_text(
+        "import json, os, pathlib, sys, time\n"
+        "request, result, runtime, ready_ack, result_ack = sys.argv[1:]\n"
+        "pathlib.Path(runtime).write_text(json.dumps({'pid': os.getpid(), 'protocol': 1}))\n"
+        "while not pathlib.Path(ready_ack).is_file(): time.sleep(0.01)\n"
+        "pathlib.Path(result).write_text(json.dumps("
+        "{'ok': False, 'error': {'type': 'ValueError'}}))\n"
+        "while not pathlib.Path(result_ack).is_file(): time.sleep(0.01)\n"
+        "time.sleep(0.1)\n"
+        "pathlib.Path(%r).write_text('exited')\n" % str(exited),
+        encoding="utf-8",
+    )
+    executable = str(Path(getattr(sys, "_base_executable", sys.executable)).resolve())
+    bridge = Cinema4dBridge(executable=executable, allowed_roots=[tmp_path])
+    bridge.driver_path = driver
+
+    with pytest.raises(BridgeError, match="Cinema 4D operation failed"):
+        bridge._invoke("unsafe.eval", {}, 10)
+
+    assert exited.read_text(encoding="utf-8") == "exited"
 
 
 @pytest.mark.parametrize("timeout", [math.nan, math.inf, -math.inf])

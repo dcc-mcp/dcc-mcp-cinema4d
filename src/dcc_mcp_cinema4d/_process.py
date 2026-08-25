@@ -17,6 +17,7 @@ from typing import Any, Mapping, Optional, Sequence
 
 _MAX_OUTPUT_BYTES = 64 * 1024
 _CLEANUP_SECS = 3.0
+_DARWIN_PS_PATHS = (Path("/bin/ps"), Path("/usr/bin/ps"))
 _SECRET_KEYS = (
     "AWS_",
     "AZURE_",
@@ -107,20 +108,32 @@ class _PosixProcessTreeOwner(_ProcessTreeOwner):
     def wait_empty(self, timeout: float) -> bool:
         deadline = time.monotonic() + max(0.0, timeout)
         while True:
-            # Reap the supervisor before probing its process group.  A dead but
-            # unreaped leader remains visible to killpg(0) on POSIX.
-            self.process.poll()
+            if sys.platform == "darwin":
+                remaining = max(0.0, deadline - time.monotonic())
+                if not _darwin_group_has_live_members(self.process.pid, remaining):
+                    # Keep the killed leader unreaped until the group has been
+                    # proven to contain no live member.  This prevents its
+                    # numeric PID/process-group identity from being reused
+                    # during the accounting window.
+                    self.process.poll()
+                    return True
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+                continue
             try:
                 os.killpg(self.process.pid, 0)
             except ProcessLookupError:
+                self.process.poll()
                 return True
             except PermissionError:
                 return False
-            if sys.platform == "darwin" and not _darwin_group_has_live_members(self.process.pid):
-                return True
+            # Reap the supervisor before probing its process group.  A dead
+            # but unreaped leader remains visible to killpg(0) on POSIX.
+            self.process.poll()
             if time.monotonic() >= deadline:
                 return False
-            time.sleep(0.01)
+            time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
 
     def contains_pid(self, pid: int) -> bool:
         if self.process.poll() is not None:
@@ -131,78 +144,49 @@ class _PosixProcessTreeOwner(_ProcessTreeOwner):
             return False
 
 
-def _darwin_group_has_live_members(process_group: int) -> bool:
+def _darwin_group_has_live_members(process_group: int, timeout: float = _CLEANUP_SECS) -> bool:
     """Distinguish live group members from launchd-owned zombies on macOS."""
-    import ctypes
-    import errno
-
-    class ProcBsdInfo(ctypes.Structure):
-        _fields_ = [
-            ("pbi_flags", ctypes.c_uint32),
-            ("pbi_status", ctypes.c_uint32),
-            ("pbi_xstatus", ctypes.c_uint32),
-            ("pbi_pid", ctypes.c_uint32),
-            ("pbi_ppid", ctypes.c_uint32),
-            ("pbi_uid", ctypes.c_uint32),
-            ("pbi_gid", ctypes.c_uint32),
-            ("pbi_ruid", ctypes.c_uint32),
-            ("pbi_rgid", ctypes.c_uint32),
-            ("pbi_svuid", ctypes.c_uint32),
-            ("pbi_svgid", ctypes.c_uint32),
-            ("pbi_rfu_1", ctypes.c_uint32),
-            ("pbi_comm", ctypes.c_char * 16),
-            ("pbi_name", ctypes.c_char * 32),
-            ("pbi_nfiles", ctypes.c_uint32),
-            ("pbi_pgid", ctypes.c_uint32),
-            ("pbi_pjobc", ctypes.c_uint32),
-            ("e_tdev", ctypes.c_uint32),
-            ("e_tpgid", ctypes.c_uint32),
-            ("pbi_nice", ctypes.c_int32),
-            ("pbi_start_tvsec", ctypes.c_uint64),
-            ("pbi_start_tvusec", ctypes.c_uint64),
-        ]
-
-    try:
-        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-        libproc.proc_listpids.argtypes = [
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-            ctypes.c_void_p,
-            ctypes.c_int,
-        ]
-        libproc.proc_listpids.restype = ctypes.c_int
-        libproc.proc_pidinfo.argtypes = [
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_uint64,
-            ctypes.c_void_p,
-            ctypes.c_int,
-        ]
-        libproc.proc_pidinfo.restype = ctypes.c_int
-        pids = (ctypes.c_int * 4096)()
-        ctypes.set_errno(0)
-        used = libproc.proc_listpids(2, process_group, pids, ctypes.sizeof(pids))
-        if used < 0:
-            return True
-        if used == 0:
-            return ctypes.get_errno() not in (0, errno.ESRCH)
-        for pid in pids[: used // ctypes.sizeof(ctypes.c_int)]:
-            if pid <= 0:
-                continue
-            info = ProcBsdInfo()
-            ctypes.set_errno(0)
-            captured = libproc.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
-            if captured != ctypes.sizeof(info):
-                if captured == 0 and ctypes.get_errno() == errno.ESRCH:
-                    continue
-                return True
-            if int(info.pbi_pid) != pid or int(info.pbi_pgid) != process_group:
-                continue
-            if int(info.pbi_status) != 5:
-                return True
-        return False
-    except (AttributeError, OSError):
+    deadline = time.monotonic() + min(_CLEANUP_SECS, max(0.0, float(timeout)))
+    ps_path = next((path for path in _DARWIN_PS_PATHS if path.is_file()), None)
+    if ps_path is None:
         return True
+    observed = None
+    for session_column in ("sid", "sess"):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return True
+        try:
+            candidate = subprocess.run(
+                [str(ps_path), "-axo", "pid=,pgid=,%s=,state=" % session_column],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=remaining,
+                check=False,
+                env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return True
+        if candidate.returncode == 0:
+            observed = candidate
+            break
+    if observed is None:
+        return True
+    for line in observed.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 4:
+            return True
+        try:
+            _pid, observed_group, observed_session = (int(value) for value in fields[:3])
+        except ValueError:
+            return True
+        state = fields[3]
+        if (
+            observed_group == process_group or observed_session == process_group
+        ) and not state.startswith("Z"):
+            return True
+    return False
 
 
 class _WindowsProcessTreeOwner(_ProcessTreeOwner):

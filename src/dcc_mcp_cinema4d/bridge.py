@@ -333,6 +333,8 @@ class Cinema4dBridge:
             if time.monotonic() >= deadline:
                 raise BridgeTimeoutError("c4dpy exceeded the configured timeout")
             _write_ack_exclusive(runtime_result_ack)
+            if os.name == "posix":
+                self._wait_for_runtime_exit(owned, int(runtime_identity["pid"]), deadline=deadline)
             stdout = _read_private_file(stdout_path, 65_537)
             stderr = _read_private_file(stderr_path, 65_537)
             if not result_path.is_file():
@@ -437,6 +439,15 @@ class Cinema4dBridge:
         from .install import _recapture_bound_runtime
 
         _recapture_bound_runtime(identity, self._host_identity_for_runtime())
+
+    @staticmethod
+    def _wait_for_runtime_exit(owned_process: Any, pid: int, *, deadline: float) -> None:
+        """Allow an acknowledged runtime to finish without granting a second budget."""
+        while owned_process.owns_pid(pid):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise BridgeTimeoutError("c4dpy exceeded the configured timeout")
+            time.sleep(min(0.01, remaining))
 
     def _host_identity_for_runtime(self):
         from .install import HostIdentity, _file_identity
