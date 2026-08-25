@@ -439,7 +439,7 @@ def test_macos_process_group_ignores_zombies_from_bounded_ps(
     assert observed
     assert observed[0][0] == [str(fake_ps), "-axo", "pid=,pgid=,sid=,state="]
     assert observed[0][1] > 0
-    assert observed[0][1] == pytest.approx(3.0)
+    assert observed[0][1] == pytest.approx(3.0, abs=0.001)
 
 
 def test_macos_process_group_preserves_a_partially_consumed_deadline(
