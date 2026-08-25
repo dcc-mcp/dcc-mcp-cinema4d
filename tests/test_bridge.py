@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from dcc_mcp_cinema4d import install
 from dcc_mcp_cinema4d.bridge import BridgeError, Cinema4dBridge
 
 
@@ -114,7 +115,21 @@ def test_output_overwrite_requires_opt_in(tmp_path):
     assert result["overwritten"] is True
 
 
-def test_packaged_driver_rejects_unknown_methods(tmp_path):
+def _accept_synthetic_runtime_identity(monkeypatch):
+    def observe(pid, _host):
+        return {
+            "pid": pid,
+            "executable_sha256": "0" * 64,
+            "executable_file_identity": "synthetic",
+            "start_identity": "synthetic:%d" % pid,
+        }
+
+    monkeypatch.setattr(install, "_observe_bound_runtime", observe)
+    monkeypatch.setattr(install, "_recapture_bound_runtime", lambda identity, _host: identity)
+
+
+def test_packaged_driver_rejects_unknown_methods(tmp_path, monkeypatch):
+    _accept_synthetic_runtime_identity(monkeypatch)
     executable = str(Path(getattr(sys, "_base_executable", sys.executable)).resolve())
     bridge = Cinema4dBridge(executable=executable, allowed_roots=[tmp_path])
 
@@ -122,7 +137,8 @@ def test_packaged_driver_rejects_unknown_methods(tmp_path):
         bridge._invoke("unsafe.eval", {}, 10)
 
 
-def test_bridge_waits_when_executable_launches_worker_and_exits(tmp_path):
+def test_bridge_waits_when_executable_launches_worker_and_exits(tmp_path, monkeypatch):
+    _accept_synthetic_runtime_identity(monkeypatch)
     launcher = tmp_path / "launcher.py"
     driver = Path(__file__).parents[1] / "src" / "dcc_mcp_cinema4d" / "cinema4d_driver.py"
     launcher.write_text(
