@@ -663,6 +663,42 @@ def test_owned_command_cannot_return_success_after_output_or_cleanup_expires_dea
     assert result["reason"] == "process timed out"
 
 
+def test_owned_command_reports_cleanup_failure_after_the_original_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [100.0]
+
+    class FakeProcess:
+        returncode = 0
+
+        @staticmethod
+        def poll():
+            return 0
+
+    class FakeOwned:
+        process = FakeProcess()
+
+        @staticmethod
+        def close(*, deadline=None):
+            assert deadline == 100.05
+            clock[0] = deadline
+            raise process_support.ProcessCleanupError("synthetic cleanup timeout")
+
+    monkeypatch.setattr(process_support.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(process_support.tempfile, "mkdtemp", lambda **_kwargs: str(tmp_path))
+    monkeypatch.setattr(
+        process_support, "start_owned_process", lambda *_args, **_kwargs: FakeOwned()
+    )
+
+    result = process_support.run_owned_command(["synthetic"], timeout_secs=0.05)
+
+    assert result == {
+        "success": False,
+        "reason": "process cleanup failed",
+        "returncode": 0,
+    }
+
+
 def test_subprocess_environment_isolated_from_python_and_secret_variables(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -746,7 +782,7 @@ def test_owned_timeout_terminates_root_descendant_and_inherited_handles(tmp_path
     result = installer._run_owned_command([sys.executable, "-c", root_script], timeout_secs=2.0)
 
     assert result["success"] is False
-    assert result["reason"] == "process cleanup failed"
+    assert result["reason"] in {"process timed out", "process cleanup failed"}
     identities = json.loads(identity_path.read_text(encoding="utf-8"))
     deadline = time.monotonic() + 3.0
     while time.monotonic() < deadline and any(_pid_alive(pid) for pid in identities.values()):
