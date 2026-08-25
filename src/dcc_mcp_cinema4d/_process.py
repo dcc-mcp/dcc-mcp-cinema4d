@@ -85,6 +85,9 @@ class _ProcessTreeOwner:
         raise NotImplementedError
 
     def wait_empty(self, timeout: float) -> bool:
+        return self.wait_empty_until(time.monotonic() + max(0.0, timeout))
+
+    def wait_empty_until(self, deadline: float) -> bool:
         return True
 
     def close(self) -> None:
@@ -92,6 +95,14 @@ class _ProcessTreeOwner:
 
     def contains_pid(self, pid: int) -> bool:
         return False
+
+    def wait_pid_exit_until(self, pid: int, deadline: float) -> bool:
+        while self.contains_pid(pid):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.01, remaining))
+        return time.monotonic() < deadline
 
 
 class _PosixProcessTreeOwner(_ProcessTreeOwner):
@@ -105,8 +116,7 @@ class _PosixProcessTreeOwner(_ProcessTreeOwner):
                 raise OSError("owned POSIX session leader identity changed")
             os.killpg(process_group, 9)
 
-    def wait_empty(self, timeout: float) -> bool:
-        deadline = time.monotonic() + max(0.0, timeout)
+    def wait_empty_until(self, deadline: float) -> bool:
         while True:
             if sys.platform == "darwin":
                 remaining = max(0.0, deadline - time.monotonic())
@@ -195,6 +205,10 @@ class _WindowsProcessTreeOwner(_ProcessTreeOwner):
     _KILL_ON_CLOSE = 0x00002000
     _SNAPTHREAD = 0x00000004
     _THREAD_SUSPEND_RESUME = 0x0002
+    _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    _SYNCHRONIZE = 0x00100000
+    _WAIT_OBJECT_0 = 0x00000000
+    _WAIT_TIMEOUT = 0x00000102
 
     def __init__(self) -> None:
         import ctypes
@@ -280,6 +294,8 @@ class _WindowsProcessTreeOwner(_ProcessTreeOwner):
             ctypes.POINTER(wintypes.BOOL),
         ]
         self._kernel32.IsProcessInJob.restype = wintypes.BOOL
+        self._kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        self._kernel32.WaitForSingleObject.restype = wintypes.DWORD
         handle = self._kernel32.CreateJobObjectW(None, None)
         if not handle:
             raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
@@ -305,8 +321,7 @@ class _WindowsProcessTreeOwner(_ProcessTreeOwner):
         if self._handle and not self._kernel32.TerminateJobObject(self._handle, 1):
             raise OSError(self._ctypes.get_last_error(), "TerminateJobObject failed")
 
-    def wait_empty(self, timeout: float) -> bool:
-        deadline = time.monotonic() + max(0.0, timeout)
+    def wait_empty_until(self, deadline: float) -> bool:
         while self._handle:
             accounting = self._accounting_type()
             if not self._kernel32.QueryInformationJobObject(
@@ -321,7 +336,7 @@ class _WindowsProcessTreeOwner(_ProcessTreeOwner):
                 return True
             if time.monotonic() >= deadline:
                 return False
-            time.sleep(0.01)
+            time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
         return True
 
     def close(self) -> None:
@@ -332,7 +347,7 @@ class _WindowsProcessTreeOwner(_ProcessTreeOwner):
     def contains_pid(self, pid: int) -> bool:
         if not self._handle or pid <= 0:
             return False
-        handle = self._kernel32.OpenProcess(0x1000, False, pid)
+        handle = self._kernel32.OpenProcess(self._PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
             return False
         try:
@@ -340,6 +355,36 @@ class _WindowsProcessTreeOwner(_ProcessTreeOwner):
             if not self._kernel32.IsProcessInJob(handle, self._handle, self._ctypes.byref(present)):
                 return False
             return bool(present.value)
+        finally:
+            self._kernel32.CloseHandle(handle)
+
+    def wait_pid_exit_until(self, pid: int, deadline: float) -> bool:
+        if not self._handle or pid <= 0 or time.monotonic() >= deadline:
+            return False
+        handle = self._kernel32.OpenProcess(
+            self._PROCESS_QUERY_LIMITED_INFORMATION | self._SYNCHRONIZE,
+            False,
+            pid,
+        )
+        if not handle:
+            # ERROR_INVALID_PARAMETER means the previously acknowledged PID
+            # exited before its wait handle could be opened. Other failures
+            # remain fail closed.
+            return self._ctypes.get_last_error() == 87 and time.monotonic() < deadline
+        try:
+            present = self._wintypes.BOOL(False)
+            if not self._kernel32.IsProcessInJob(handle, self._handle, self._ctypes.byref(present)):
+                return False
+            if not present.value:
+                return time.monotonic() < deadline
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            wait_ms = max(1, min(0xFFFFFFFE, int(math.ceil(remaining * 1000.0))))
+            outcome = self._kernel32.WaitForSingleObject(handle, wait_ms)
+            if outcome == self._WAIT_TIMEOUT:
+                return False
+            return outcome == self._WAIT_OBJECT_0 and time.monotonic() < deadline
         finally:
             self._kernel32.CloseHandle(handle)
 
@@ -407,7 +452,10 @@ class OwnedProcess:
     def owns_pid(self, pid: int) -> bool:
         return self.owner.contains_pid(pid)
 
-    def close(self) -> None:
+    def wait_pid_exit_until(self, pid: int, deadline: float) -> bool:
+        return self.owner.wait_pid_exit_until(pid, deadline)
+
+    def close(self, *, deadline: float) -> None:
         cleanup_failed = False
         try:
             try:
@@ -419,7 +467,7 @@ class OwnedProcess:
                     except OSError:
                         cleanup_failed = True
             try:
-                self.process.wait(timeout=_CLEANUP_SECS)
+                self.process.wait(timeout=max(0.0, deadline - time.monotonic()))
             except (OSError, subprocess.TimeoutExpired):
                 if self.process.poll() is None:
                     try:
@@ -427,14 +475,14 @@ class OwnedProcess:
                     except OSError:
                         cleanup_failed = True
                 try:
-                    self.process.wait(timeout=1.0)
+                    self.process.wait(timeout=max(0.0, deadline - time.monotonic()))
                 except (OSError, subprocess.TimeoutExpired):
                     cleanup_failed = True
             if self.process.poll() is None:
                 cleanup_failed = True
         finally:
             try:
-                if not self.owner.wait_empty(_CLEANUP_SECS):
+                if not self.owner.wait_empty_until(deadline):
                     cleanup_failed = True
             except BaseException:
                 cleanup_failed = True
@@ -501,10 +549,14 @@ def _read_json(path: Path) -> Optional[dict[str, Any]]:
     return value if isinstance(value, dict) else None
 
 
-def _read_bounded_output(path: Path) -> tuple[bytes, bool, bool]:
+def _read_bounded_output(path: Path, *, deadline: float) -> tuple[bytes, bool, bool]:
     """Read only an unchanged regular output file and never allocate unbounded data."""
     try:
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired("owned process output", 0)
         before = os.lstat(path)
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired("owned process output", 0)
         attributes = int(getattr(before, "st_file_attributes", 0))
         if not stat.S_ISREG(before.st_mode) or attributes & int(
             getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
@@ -512,9 +564,17 @@ def _read_bounded_output(path: Path) -> tuple[bytes, bool, bool]:
             return b"", False, True
         if before.st_size > _MAX_OUTPUT_BYTES + 1:
             return b"", True, False
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired("owned process output", 0)
         with path.open("rb") as stream:
             payload = stream.read(_MAX_OUTPUT_BYTES + 1)
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired("owned process output", 0)
         after = os.lstat(path)
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired("owned process output", 0)
+    except subprocess.TimeoutExpired:
+        raise
     except OSError:
         return b"", False, True
     changed = (
@@ -535,6 +595,9 @@ def _start_posix_supervised_process(
     stderr: Any,
     deadline: Optional[float],
 ) -> OwnedProcess:
+    operation_deadline = deadline if deadline is not None else time.monotonic() + 5.0
+    if time.monotonic() >= operation_deadline:
+        raise subprocess.TimeoutExpired("owned process launch", 0)
     status_path = cwd / "process-status.json"
     ready_path = cwd / "process-ready.json"
     supervisor_script = Path(__file__).with_name("_process_supervisor.py").resolve(strict=True)
@@ -558,7 +621,7 @@ def _start_posix_supervised_process(
     owner = _PosixProcessTreeOwner(supervisor)
     ready_deadline = min(
         time.monotonic() + 5.0,
-        deadline if deadline is not None else time.monotonic() + 5.0,
+        operation_deadline,
     )
     try:
         while time.monotonic() < ready_deadline:
@@ -592,9 +655,10 @@ def _start_posix_supervised_process(
             if supervisor.poll() is None:
                 supervisor.kill()
         try:
-            supervisor.wait(timeout=_CLEANUP_SECS)
+            supervisor.wait(timeout=max(0.0, operation_deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             pass
+        owner.wait_empty_until(operation_deadline)
         owner.close()
         raise
 
@@ -608,6 +672,9 @@ def start_owned_process(
     stderr: Any,
     deadline: Optional[float] = None,
 ) -> OwnedProcess:
+    operation_deadline = deadline if deadline is not None else time.monotonic() + 5.0
+    if time.monotonic() >= operation_deadline:
+        raise subprocess.TimeoutExpired("owned process launch", 0)
     kwargs: dict[str, Any] = {
         "cwd": os.fspath(cwd),
         "env": dict(environment),
@@ -623,7 +690,7 @@ def start_owned_process(
             environment=environment,
             stdout=stdout,
             stderr=stderr,
-            deadline=deadline,
+            deadline=operation_deadline,
         )
     if os.name == "nt":
         owner = _WindowsProcessTreeOwner()
@@ -631,8 +698,14 @@ def start_owned_process(
         try:
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | 0x00000004
             process = subprocess.Popen(list(command), creationflags=flags, **kwargs)
+            if time.monotonic() >= operation_deadline:
+                raise subprocess.TimeoutExpired("owned process launch", 0)
             owner.assign(process)
+            if time.monotonic() >= operation_deadline:
+                raise subprocess.TimeoutExpired("owned process launch", 0)
             _resume_windows_process(process)
+            if time.monotonic() >= operation_deadline:
+                raise subprocess.TimeoutExpired("owned process launch", 0)
             return OwnedProcess(process, owner)
         except BaseException:
             try:
@@ -642,9 +715,10 @@ def start_owned_process(
                     process.kill()
             if process is not None:
                 try:
-                    process.wait(timeout=_CLEANUP_SECS)
+                    process.wait(timeout=max(0.0, operation_deadline - time.monotonic()))
                 except subprocess.TimeoutExpired:
                     pass
+            owner.wait_empty_until(operation_deadline)
             owner.close()
             raise
     process = subprocess.Popen(list(command), **kwargs)
@@ -667,16 +741,27 @@ def run_owned_command(
     owned = None
     returncode = None
     cleanup_error = False
+    expired = False
+    stdout = b""
+    stderr = b""
+    stdout_truncated = False
+    stderr_truncated = False
     try:
-        with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired("owned process setup", timeout)
+        with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired("owned process setup", timeout)
             owned = start_owned_process(
                 command,
                 cwd=root,
                 environment=isolated_environment(environment),
-                stdout=stdout,
-                stderr=stderr,
+                stdout=stdout_file,
+                stderr=stderr_file,
                 deadline=deadline,
             )
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired("owned process launch", timeout)
         while owned.process.poll() is None and time.monotonic() < deadline:
             if any(
                 path.is_file() and path.stat().st_size > _MAX_OUTPUT_BYTES
@@ -692,6 +777,8 @@ def run_owned_command(
         else:
             returncode = int(owned.process.returncode)
             reason = None if returncode == 0 else "process failed"
+        if time.monotonic() >= deadline:
+            reason = "process timed out"
     except subprocess.TimeoutExpired:
         reason = "process timed out"
     except (OSError, ValueError):
@@ -699,21 +786,33 @@ def run_owned_command(
     finally:
         if owned is not None:
             try:
-                owned.close()
+                owned.close(deadline=deadline)
             except ProcessCleanupError:
                 cleanup_error = True
-        stdout, stdout_truncated, stdout_unsafe = _read_bounded_output(stdout_path)
-        stderr, stderr_truncated, stderr_unsafe = _read_bounded_output(stderr_path)
-        if stdout_unsafe or stderr_unsafe:
-            cleanup_error = True
-        elif (stdout_truncated or stderr_truncated) and reason is None:
-            reason = "process output exceeded limit"
+        try:
+            stdout, stdout_truncated, stdout_unsafe = _read_bounded_output(
+                stdout_path, deadline=deadline
+            )
+            stderr, stderr_truncated, stderr_unsafe = _read_bounded_output(
+                stderr_path, deadline=deadline
+            )
+        except subprocess.TimeoutExpired:
+            expired = True
+            stdout_unsafe = stderr_unsafe = False
+        else:
+            if stdout_unsafe or stderr_unsafe:
+                cleanup_error = True
+            elif (stdout_truncated or stderr_truncated) and reason is None:
+                reason = "process output exceeded limit"
         try:
             shutil.rmtree(root)
         except OSError:
             cleanup_error = True
+        expired = expired or time.monotonic() >= deadline
     if cleanup_error:
         return {"success": False, "reason": "process cleanup failed", "returncode": returncode}
+    if expired:
+        reason = "process timed out"
     return {
         "success": reason is None,
         "reason": reason,

@@ -1,12 +1,13 @@
+import json
 import math
-import os
 import sys
 from pathlib import Path
 
 import pytest
 
+from dcc_mcp_cinema4d import bridge as bridge_module
 from dcc_mcp_cinema4d import install
-from dcc_mcp_cinema4d.bridge import BridgeError, Cinema4dBridge
+from dcc_mcp_cinema4d.bridge import BridgeError, BridgeTimeoutError, Cinema4dBridge
 
 
 class FakeBridge(Cinema4dBridge):
@@ -155,7 +156,6 @@ def test_bridge_waits_when_executable_launches_worker_and_exits(tmp_path, monkey
         bridge._invoke("unsafe.eval", {}, 10)
 
 
-@pytest.mark.skipif(os.name != "posix", reason="POSIX orphan-reaping contract")
 def test_bridge_allows_acknowledged_runtime_to_exit_before_cleanup(tmp_path, monkeypatch):
     _accept_synthetic_runtime_identity(monkeypatch)
     exited = tmp_path / "runtime-exited"
@@ -163,12 +163,15 @@ def test_bridge_allows_acknowledged_runtime_to_exit_before_cleanup(tmp_path, mon
     driver.write_text(
         "import json, os, pathlib, sys, time\n"
         "request, result, runtime, ready_ack, result_ack = sys.argv[1:]\n"
-        "pathlib.Path(runtime).write_text(json.dumps({'pid': os.getpid(), 'protocol': 1}))\n"
+        "runtime_tmp=pathlib.Path(runtime + '.tmp')\n"
+        "runtime_tmp.write_text(json.dumps({'pid': os.getpid(), 'protocol': 1}))\n"
+        "runtime_tmp.replace(runtime)\n"
         "while not pathlib.Path(ready_ack).is_file(): time.sleep(0.01)\n"
-        "pathlib.Path(result).write_text(json.dumps("
-        "{'ok': False, 'error': {'type': 'ValueError'}}))\n"
+        "result_tmp=pathlib.Path(result + '.tmp')\n"
+        "result_tmp.write_text(json.dumps({'ok': False, 'error': {'type': 'ValueError'}}))\n"
+        "result_tmp.replace(result)\n"
         "while not pathlib.Path(result_ack).is_file(): time.sleep(0.01)\n"
-        "time.sleep(0.1)\n"
+        "time.sleep(0.2)\n"
         "pathlib.Path(%r).write_text('exited')\n" % str(exited),
         encoding="utf-8",
     )
@@ -180,6 +183,85 @@ def test_bridge_allows_acknowledged_runtime_to_exit_before_cleanup(tmp_path, mon
         bridge._invoke("unsafe.eval", {}, 10)
 
     assert exited.read_text(encoding="utf-8") == "exited"
+
+
+def test_runtime_exit_rechecks_the_original_deadline_after_ownership_turns_false(
+    monkeypatch,
+):
+    class SlowOwnershipProbe:
+        def owns_pid(self, _pid):
+            monkeypatch.setattr(bridge_module.time, "monotonic", lambda: 10.1)
+            return False
+
+    monkeypatch.setattr(bridge_module.time, "monotonic", lambda: 9.9)
+
+    with pytest.raises(BridgeTimeoutError, match="configured timeout"):
+        Cinema4dBridge._wait_for_runtime_exit(SlowOwnershipProbe(), 1234, deadline=10.0)
+
+
+def test_bridge_cleanup_cannot_turn_an_expired_operation_into_success(tmp_path, monkeypatch):
+    clock = [100.0]
+
+    class FakeProcess:
+        returncode = 0
+
+        @staticmethod
+        def poll():
+            return 0
+
+    class FakeOwned:
+        process = FakeProcess()
+
+        @staticmethod
+        def wait_pid_exit_until(_pid, _deadline):
+            return True
+
+        @staticmethod
+        def close(*, deadline):
+            assert deadline == 100.05
+            clock[0] = 100.06
+
+    def fake_start(_command, *, cwd, **_kwargs):
+        (cwd / "result.json").write_text(
+            json.dumps({"ok": True, "result": {"ready": True}}), encoding="utf-8"
+        )
+        return FakeOwned()
+
+    executable = str(Path(getattr(sys, "_base_executable", sys.executable)).resolve())
+    bridge = Cinema4dBridge(executable=executable, allowed_roots=[tmp_path])
+    monkeypatch.setattr(bridge_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(bridge_module, "start_owned_process", fake_start)
+    monkeypatch.setattr(
+        bridge,
+        "_acknowledge_runtime",
+        lambda *_args, **_kwargs: {"pid": 1234, "start_identity": "synthetic"},
+    )
+    monkeypatch.setattr(bridge, "_recapture_runtime", lambda _identity: None)
+
+    with pytest.raises(BridgeTimeoutError, match="configured timeout"):
+        bridge._invoke("system.status", {}, timeout_secs=0.05)
+
+
+def test_private_artifact_retries_transient_windows_sharing_denial(tmp_path, monkeypatch):
+    artifact = tmp_path / "result.json"
+    artifact.write_bytes(b"{}")
+    original_open = Path.open
+    attempts = []
+
+    def transient_open(path, *args, **kwargs):
+        if path == artifact and not attempts:
+            attempts.append("denied")
+            raise PermissionError(13, "synthetic sharing denial")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", transient_open)
+
+    payload = bridge_module._read_private_file(
+        artifact, 64, deadline=bridge_module.time.monotonic() + 1.0
+    )
+
+    assert payload == b"{}"
+    assert attempts == ["denied"]
 
 
 @pytest.mark.parametrize("timeout", [math.nan, math.inf, -math.inf])

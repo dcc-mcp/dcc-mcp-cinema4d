@@ -114,6 +114,15 @@ class LifecycleFailure(RuntimeError):
         self.exit_code = exit_code
 
 
+def _require_deadline(deadline: float) -> None:
+    if time.monotonic() >= deadline:
+        raise LifecycleFailure(
+            "runtime_timeout",
+            "Cinema 4D lifecycle operation exceeded its caller deadline.",
+            INSTALL_EXIT_VERIFY,
+        )
+
+
 def _require_official_core_contract() -> None:
     try:
         schema = load_install_sop_schema()
@@ -655,8 +664,29 @@ def _resolve_context(request: LifecycleRequest, environ: Mapping[str, str]) -> I
     return InstallContext(host, python, state_root, receipt_path, state, receipt, receipt_identity)
 
 
+class _MutationLease:
+    def __init__(self) -> None:
+        self.path: Optional[Path] = None
+        self.previous: Optional[bytes] = None
+        self.armed = False
+
+    def arm(self, path: Path, previous: Optional[bytes]) -> None:
+        self.path = path
+        self.previous = previous
+        self.armed = True
+
+    def disarm(self) -> None:
+        self.armed = False
+
+    def rollback(self) -> None:
+        if self.armed and self.path is not None:
+            _restore_receipt(self.path, self.previous)
+            self.disarm()
+
+
 @contextmanager
-def _mutation_lock(state_root: Path) -> Iterator[None]:
+def _mutation_lock(state_root: Path, *, deadline: float) -> Iterator[_MutationLease]:
+    _require_deadline(deadline)
     key = os.path.normcase(str(state_root.absolute()))
     lock_path = state_root / ".locks" / "lifecycle.lock"
     with _LOCK_GUARD:
@@ -671,13 +701,17 @@ def _mutation_lock(state_root: Path) -> Iterator[None]:
     identity = None
     cleanup_failure = None
     primary = None
+    lease = _MutationLease()
     try:
+        _require_deadline(deadline)
         lock_path.parent.mkdir(parents=True, exist_ok=True)
+        _require_deadline(deadline)
         if _is_link_or_reparse(lock_path.parent):
             raise LifecycleFailure(
                 "state", "The lifecycle lock directory cannot be a link or reparse point."
             )
         try:
+            _require_deadline(deadline)
             descriptor = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError as exc:
             raise LifecycleFailure(
@@ -687,9 +721,13 @@ def _mutation_lock(state_root: Path) -> Iterator[None]:
             ) from exc
         info = os.fstat(descriptor)
         identity = (int(info.st_dev), int(info.st_ino))
+        _require_deadline(deadline)
         os.write(descriptor, ("pid=%d\n" % os.getpid()).encode("ascii"))
+        _require_deadline(deadline)
         os.fsync(descriptor)
-        yield
+        _require_deadline(deadline)
+        yield lease
+        _require_deadline(deadline)
     except BaseException as exc:
         primary = exc
     finally:
@@ -723,6 +761,25 @@ def _mutation_lock(state_root: Path) -> Iterator[None]:
                 cleanup_failure.__cause__ = exc
         with _LOCK_GUARD:
             _LOCKED_ROOTS.discard(key)
+        if primary is None and time.monotonic() >= deadline:
+            primary = LifecycleFailure(
+                "runtime_timeout",
+                "Cinema 4D lifecycle operation exceeded its caller deadline.",
+                INSTALL_EXIT_VERIFY,
+            )
+    if (primary is not None or cleanup_failure is not None) and lease.armed:
+        try:
+            lease.rollback()
+        except BaseException as exc:
+            rollback_failure = LifecycleFailure(
+                "rollback",
+                "The previous install receipt could not be restored.",
+                INSTALL_EXIT_INSTALL,
+            )
+            rollback_failure.__cause__ = exc
+            if primary is not None:
+                raise rollback_failure from primary
+            raise rollback_failure from exc
     if cleanup_failure is not None:
         if primary is not None:
             raise cleanup_failure from primary
@@ -731,8 +788,10 @@ def _mutation_lock(state_root: Path) -> Iterator[None]:
         raise primary
 
 
-def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+def _write_json_atomic(path: Path, payload: Mapping[str, Any], *, deadline: float) -> None:
+    _require_deadline(deadline)
     path.parent.mkdir(parents=True, exist_ok=True)
+    _require_deadline(deadline)
     if _is_link_or_reparse(path.parent):
         raise LifecycleFailure(
             "receipt",
@@ -741,12 +800,19 @@ def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
         )
     temporary = path.with_name(".%s.%s.tmp" % (path.name, uuid.uuid4().hex))
     try:
+        _require_deadline(deadline)
         with temporary.open("x", encoding="utf-8", newline="\n") as stream:
+            _require_deadline(deadline)
             json.dump(payload, stream, indent=2, sort_keys=True)
+            _require_deadline(deadline)
             stream.write("\n")
             stream.flush()
+            _require_deadline(deadline)
             os.fsync(stream.fileno())
+            _require_deadline(deadline)
+        _require_deadline(deadline)
         os.replace(str(temporary), str(path))
+        _require_deadline(deadline)
     except BaseException as primary:
         if temporary.exists():
             try:
@@ -1198,8 +1264,11 @@ def _mutate(
     environ: Mapping[str, str],
     deadline: float,
 ) -> LifecycleOutcome:
-    with _mutation_lock(context.state_root):
+    _require_deadline(deadline)
+    with _mutation_lock(context.state_root, deadline=deadline) as mutation:
+        _require_deadline(deadline)
         current = _resolve_context(request, environ)
+        _require_deadline(deadline)
         if os.path.normcase(str(current.state_root.absolute())) != os.path.normcase(
             str(context.state_root.absolute())
         ):
@@ -1210,8 +1279,11 @@ def _mutate(
             )
         context = current
         _recapture_receipt(context)
+        _require_deadline(deadline)
         previous = context.receipt_path.read_bytes() if context.receipt_path.is_file() else None
+        _require_deadline(deadline)
         _recapture_host(context)
+        _require_deadline(deadline)
         if request.operation == "uninstall":
             if context.receipt is None:
                 verify = {"directly_usable": False, "failure_stage": None, "failure_reason": None}
@@ -1223,6 +1295,7 @@ def _mutate(
                     steps=[{"id": "uninstall", "status": "already_absent"}],
                 )
                 result["install_state"] = "fresh"
+                _require_deadline(deadline)
                 return LifecycleOutcome(result, INSTALL_EXIT_OK)
             if not _receipt_matches(context, context.receipt):
                 raise LifecycleFailure(
@@ -1231,6 +1304,8 @@ def _mutate(
                     INSTALL_EXIT_INSTALL,
                 )
             _recapture_receipt(context)
+            _require_deadline(deadline)
+            mutation.arm(context.receipt_path, previous)
             try:
                 context.receipt_path.unlink()
             except OSError as exc:
@@ -1239,6 +1314,7 @@ def _mutate(
                     "The owned install receipt could not be removed.",
                     INSTALL_EXIT_INSTALL,
                 ) from exc
+            _require_deadline(deadline)
             verify = {"directly_usable": False, "failure_stage": None, "failure_reason": None}
             result = _public_result(
                 request.operation,
@@ -1248,6 +1324,7 @@ def _mutate(
                 steps=[{"id": "uninstall", "status": "removed"}],
             )
             result["install_state"] = "fresh"
+            _require_deadline(deadline)
             return LifecycleOutcome(result, INSTALL_EXIT_OK)
         if context.state == "partial":
             raise LifecycleFailure(
@@ -1257,6 +1334,7 @@ def _mutate(
             )
         if request.operation == "install" and context.state == "current":
             verify = _verify_runtime(context, deadline)
+            _require_deadline(deadline)
             status = "ok" if verify["directly_usable"] else "failed"
             result = _public_result(
                 request.operation,
@@ -1271,9 +1349,14 @@ def _mutate(
             return LifecycleOutcome(
                 result, INSTALL_EXIT_OK if status == "ok" else INSTALL_EXIT_VERIFY
             )
-        _write_json_atomic(context.receipt_path, _build_receipt(context))
+        _require_deadline(deadline)
+        mutation.arm(context.receipt_path, previous)
+        _write_json_atomic(context.receipt_path, _build_receipt(context), deadline=deadline)
+        _require_deadline(deadline)
         current = replace(context, state="current", receipt=_load_receipt(context.receipt_path))
+        _require_deadline(deadline)
         verify = _verify_runtime(current, deadline)
+        _require_deadline(deadline)
         if not verify["directly_usable"]:
             try:
                 _restore_receipt(context.receipt_path, previous)
@@ -1283,6 +1366,7 @@ def _mutate(
                     "The previous install receipt could not be restored.",
                     INSTALL_EXIT_INSTALL,
                 ) from exc
+            mutation.disarm()
             result = _public_result(
                 request.operation,
                 context,
@@ -1294,8 +1378,10 @@ def _mutate(
                 ],
             )
             result["previous_restored"] = True
+            _require_deadline(deadline)
             return LifecycleOutcome(result, INSTALL_EXIT_VERIFY)
         _recapture_host(current)
+        _require_deadline(deadline)
         result = _public_result(
             request.operation,
             current,
@@ -1307,6 +1393,7 @@ def _mutate(
                 {"id": "verify", "status": "ok"},
             ],
         )
+        _require_deadline(deadline)
         return LifecycleOutcome(result, INSTALL_EXIT_OK)
 
 
@@ -1347,17 +1434,23 @@ def failure_outcome(operation: str, stage: str, exit_code: int) -> LifecycleOutc
 def run_lifecycle(
     request: LifecycleRequest, *, environ: Optional[Mapping[str, str]] = None
 ) -> LifecycleOutcome:
+    started = time.monotonic()
     operation = request.target if request.operation == "plan" else request.operation
     if operation not in {"install", "status", "verify", "uninstall", "upgrade"}:
         return failure_outcome(request.operation, "arguments", INSTALL_EXIT_PREFLIGHT)
     try:
-        started = time.monotonic()
         timeout = validate_timeout(request.timeout_secs, maximum=MAX_TIMEOUT_SECS)
         deadline = started + timeout
+        _require_deadline(deadline)
         request = replace(request, operation=operation, timeout_secs=timeout)
-        context = _resolve_context(request, dict(os.environ if environ is None else environ))
+        lifecycle_environment = dict(os.environ if environ is None else environ)
+        _require_deadline(deadline)
+        context = _resolve_context(request, lifecycle_environment)
+        _require_deadline(deadline)
         if request.operation in {"install", "uninstall", "upgrade"} and not request.execute:
-            return _planned(context, request.operation)
+            outcome = _planned(context, request.operation)
+            _require_deadline(deadline)
+            return outcome
         if request.operation == "status":
             verify = {"directly_usable": False, "failure_stage": None, "failure_reason": None}
             result = _public_result(
@@ -1367,9 +1460,11 @@ def run_lifecycle(
                 verify=verify,
                 steps=[{"id": "status", "status": context.state}],
             )
+            _require_deadline(deadline)
             return LifecycleOutcome(result, INSTALL_EXIT_OK)
         if request.operation == "verify":
             verify = _verify_runtime(context, deadline)
+            _require_deadline(deadline)
             status = "ok" if verify["directly_usable"] else "failed"
             result = _public_result(
                 "verify",
@@ -1384,7 +1479,7 @@ def run_lifecycle(
         return _mutate(
             context,
             request,
-            dict(os.environ if environ is None else environ),
+            lifecycle_environment,
             deadline,
         )
     except LifecycleFailure as exc:
