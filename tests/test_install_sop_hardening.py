@@ -333,6 +333,34 @@ def test_macos_process_group_listing_distinguishes_empty_from_error(
     assert process_support._darwin_group_has_live_members(12345) is expected
 
 
+def test_macos_missing_process_group_is_not_reported_as_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ctypes
+    import errno
+
+    class FakeFunction:
+        def __init__(self, callback) -> None:
+            self.callback = callback
+            self.argtypes = None
+            self.restype = None
+
+        def __call__(self, *args: object) -> int:
+            return int(self.callback(*args))
+
+    def missing_group(*_args: object) -> int:
+        ctypes.set_errno(errno.ESRCH)
+        return 0
+
+    class FakeLibproc:
+        proc_listpids = FakeFunction(missing_group)
+        proc_pidinfo = FakeFunction(lambda *_args: -1)
+
+    monkeypatch.setattr(ctypes, "CDLL", lambda _path, **_kwargs: FakeLibproc())
+
+    assert process_support._darwin_group_has_live_members(12345) is False
+
+
 def test_macos_process_group_ignores_a_member_gone_before_recapture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

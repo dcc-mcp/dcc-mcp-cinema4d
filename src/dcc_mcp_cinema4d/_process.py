@@ -185,7 +185,7 @@ def _darwin_group_has_live_members(process_group: int) -> bool:
         if used < 0:
             return True
         if used == 0:
-            return ctypes.get_errno() != 0
+            return ctypes.get_errno() not in (0, errno.ESRCH)
         for pid in pids[: used // ctypes.sizeof(ctypes.c_int)]:
             if pid <= 0:
                 continue
