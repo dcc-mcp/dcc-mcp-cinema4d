@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
@@ -223,9 +224,9 @@ def test_mutation_lock_rejects_concurrent_install_and_cleanup_failure_is_visible
     tmp_path: Path,
 ) -> None:
     state_root = tmp_path / "state"
-    with installer._mutation_lock(state_root):
+    with installer._mutation_lock(state_root, deadline=time.monotonic() + 2.0):
         with pytest.raises(installer.LifecycleFailure, match="already in progress"):
-            with installer._mutation_lock(state_root):
+            with installer._mutation_lock(state_root, deadline=time.monotonic() + 2.0):
                 pass
 
 
@@ -498,6 +499,170 @@ def test_lifecycle_uses_one_absolute_deadline_from_caller_entry(
     assert outcome.exit_code == 40
 
 
+@pytest.mark.parametrize("operation", ["status", "install"])
+def test_lifecycle_rejects_success_after_slow_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    context = _context(tmp_path)
+    clock = [100.0]
+    request = replace(_request(tmp_path, operation), timeout_secs=0.05)
+    monkeypatch.setattr(installer.time, "monotonic", lambda: clock[0])
+
+    def slow_resolve(*_args, **_kwargs):
+        clock[0] = 100.06
+        return context
+
+    monkeypatch.setattr(installer, "_resolve_context", slow_resolve)
+
+    outcome = installer.run_lifecycle(request, environ={})
+
+    assert outcome.exit_code == installer.INSTALL_EXIT_VERIFY
+    assert outcome.result["status"] == "failed"
+    assert outcome.result["verify"]["failure_stage"] == "runtime_timeout"
+
+
+@pytest.mark.parametrize("operation", ["install", "uninstall"])
+def test_lifecycle_expiry_after_lock_cannot_write_or_unlink_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    context = _context(tmp_path)
+    if operation == "uninstall":
+        receipt = installer._build_receipt(context)
+        context.receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        context.receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        context = replace(context, state="current", receipt=receipt)
+    before = context.receipt_path.read_bytes() if context.receipt_path.exists() else None
+    clock = [100.0]
+    request = replace(_request(tmp_path, operation, execute=True), timeout_secs=0.05)
+    monkeypatch.setattr(installer.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(installer, "_resolve_context", lambda *_args, **_kwargs: context)
+    monkeypatch.setattr(installer, "_recapture_receipt", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(installer, "_recapture_host", lambda current: current.host)
+    monkeypatch.setattr(
+        installer,
+        "_verify_runtime",
+        lambda *_args, **_kwargs: {
+            "directly_usable": True,
+            "failure_stage": None,
+            "failure_reason": None,
+        },
+    )
+
+    @contextmanager
+    def slow_lock(_state_root, *, deadline):
+        assert deadline == 100.05
+        clock[0] = 100.06
+        yield
+
+    monkeypatch.setattr(installer, "_mutation_lock", slow_lock)
+
+    outcome = installer.run_lifecycle(request, environ={})
+
+    after = context.receipt_path.read_bytes() if context.receipt_path.exists() else None
+    assert outcome.exit_code == installer.INSTALL_EXIT_VERIFY
+    assert outcome.result["verify"]["failure_stage"] == "runtime_timeout"
+    assert after == before
+
+
+def test_lifecycle_rolls_back_when_lock_cleanup_consumes_the_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = _context(tmp_path)
+    receipt = installer._build_receipt(context)
+    context.receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    context.receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    previous = context.receipt_path.read_bytes()
+    context = replace(context, state="current", receipt=receipt)
+    clock = [100.0]
+    request = replace(_request(tmp_path, "uninstall", execute=True), timeout_secs=0.05)
+    original_unlink = Path.unlink
+    monkeypatch.setattr(installer.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(installer, "_resolve_context", lambda *_args, **_kwargs: context)
+    monkeypatch.setattr(installer, "_recapture_receipt", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(installer, "_recapture_host", lambda current: current.host)
+
+    def delayed_lock_unlink(path, *args, **kwargs):
+        result = original_unlink(path, *args, **kwargs)
+        if path.name == "lifecycle.lock":
+            clock[0] = 100.06
+        return result
+
+    monkeypatch.setattr(Path, "unlink", delayed_lock_unlink)
+
+    outcome = installer.run_lifecycle(request, environ={})
+
+    assert outcome.exit_code == installer.INSTALL_EXIT_VERIFY
+    assert outcome.result["verify"]["failure_stage"] == "runtime_timeout"
+    assert context.receipt_path.read_bytes() == previous
+
+
+def test_lifecycle_rolls_back_when_atomic_replace_crosses_the_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = _context(tmp_path)
+    clock = [100.0]
+    request = replace(_request(tmp_path, "install", execute=True), timeout_secs=0.05)
+    original_replace = os.replace
+    monkeypatch.setattr(installer.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(installer, "_resolve_context", lambda *_args, **_kwargs: context)
+    monkeypatch.setattr(installer, "_recapture_receipt", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(installer, "_recapture_host", lambda current: current.host)
+
+    def delayed_receipt_replace(source, target):
+        result = original_replace(source, target)
+        if Path(target) == context.receipt_path:
+            clock[0] = 100.06
+        return result
+
+    monkeypatch.setattr(installer.os, "replace", delayed_receipt_replace)
+
+    outcome = installer.run_lifecycle(request, environ={})
+
+    assert outcome.exit_code == installer.INSTALL_EXIT_VERIFY
+    assert outcome.result["verify"]["failure_stage"] == "runtime_timeout"
+    assert not context.receipt_path.exists()
+
+
+def test_owned_command_cannot_return_success_after_output_or_cleanup_expires_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [100.0]
+    close_deadlines = []
+
+    class FakeProcess:
+        returncode = 0
+
+        @staticmethod
+        def poll():
+            return 0
+
+    class FakeOwned:
+        process = FakeProcess()
+
+        @staticmethod
+        def close(*, deadline=None):
+            close_deadlines.append(deadline)
+
+    monkeypatch.setattr(process_support.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(process_support.tempfile, "mkdtemp", lambda **_kwargs: str(tmp_path))
+    monkeypatch.setattr(
+        process_support, "start_owned_process", lambda *_args, **_kwargs: FakeOwned()
+    )
+
+    def delayed_read(_path, *, deadline):
+        assert deadline == 100.05
+        clock[0] = 100.06
+        return b"", False, False
+
+    monkeypatch.setattr(process_support, "_read_bounded_output", delayed_read)
+
+    result = process_support.run_owned_command(["synthetic"], timeout_secs=0.05)
+
+    assert close_deadlines == [100.05]
+    assert result["success"] is False
+    assert result["reason"] == "process timed out"
+
+
 def test_subprocess_environment_isolated_from_python_and_secret_variables(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -581,7 +746,7 @@ def test_owned_timeout_terminates_root_descendant_and_inherited_handles(tmp_path
     result = installer._run_owned_command([sys.executable, "-c", root_script], timeout_secs=2.0)
 
     assert result["success"] is False
-    assert result["reason"] == "process timed out"
+    assert result["reason"] == "process cleanup failed"
     identities = json.loads(identity_path.read_text(encoding="utf-8"))
     deadline = time.monotonic() + 3.0
     while time.monotonic() < deadline and any(_pid_alive(pid) for pid in identities.values()):
