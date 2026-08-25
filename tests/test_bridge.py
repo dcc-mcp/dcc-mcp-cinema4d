@@ -1,3 +1,4 @@
+import math
 import sys
 from pathlib import Path
 
@@ -114,9 +115,10 @@ def test_output_overwrite_requires_opt_in(tmp_path):
 
 
 def test_packaged_driver_rejects_unknown_methods(tmp_path):
-    bridge = Cinema4dBridge(executable=sys.executable, allowed_roots=[tmp_path])
+    executable = getattr(sys, "_base_executable", sys.executable)
+    bridge = Cinema4dBridge(executable=executable, allowed_roots=[tmp_path])
 
-    with pytest.raises(BridgeError, match="Unknown Cinema 4D method"):
+    with pytest.raises(BridgeError, match="Cinema 4D operation failed"):
         bridge._invoke("unsafe.eval", {}, 10)
 
 
@@ -128,8 +130,17 @@ def test_bridge_waits_when_executable_launches_worker_and_exits(tmp_path):
         "subprocess.Popen([sys.executable, %r, *sys.argv[1:]])\n" % str(driver),
         encoding="utf-8",
     )
-    bridge = Cinema4dBridge(executable=sys.executable, allowed_roots=[tmp_path])
+    executable = getattr(sys, "_base_executable", sys.executable)
+    bridge = Cinema4dBridge(executable=executable, allowed_roots=[tmp_path])
     bridge.driver_path = launcher
 
-    with pytest.raises(BridgeError, match="Unknown Cinema 4D method"):
+    with pytest.raises(BridgeError, match="Cinema 4D operation failed"):
         bridge._invoke("unsafe.eval", {}, 10)
+
+
+@pytest.mark.parametrize("timeout", [math.nan, math.inf, -math.inf])
+def test_bridge_rejects_non_finite_timeout(timeout, tmp_path):
+    bridge = Cinema4dBridge(executable=sys.executable, allowed_roots=[tmp_path])
+
+    with pytest.raises(BridgeError, match="finite"):
+        bridge._timeout(timeout)

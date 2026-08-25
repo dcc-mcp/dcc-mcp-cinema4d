@@ -25,10 +25,15 @@ def test_install_guide_documents_standalone_wheel_and_verify_contract() -> None:
     assert "python -m pip install dcc-mcp-cinema4d" in guide
     assert "pip install -e" not in guide
     assert "dcc-mcp-cinema4d doctor --json" in guide
-    assert "dcc-mcp-cinema4d verify" in guide
+    for operation in ("plan", "install", "status", "verify", "uninstall", "upgrade"):
+        assert "dcc-mcp-cinema4d %s" % operation in guide
     assert all("`%s`" % code in guide for code in (0, 10, 40))
     assert "does not download" in guide
     assert "no adapter-managed binary cache" in guide
+    assert "atomic receipt" in guide
+    assert "mutation lock" in guide
+    assert "dcc-mcp-core>=0.20.14" in guide
+    assert "There is no adapter daemon" in guide
     assert "https://raw.githubusercontent.com/dcc-mcp/dcc-mcp-cinema4d/main/install.md" in guide
 
 

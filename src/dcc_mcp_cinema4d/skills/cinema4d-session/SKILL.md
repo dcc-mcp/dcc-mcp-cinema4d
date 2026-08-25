@@ -4,7 +4,7 @@ description: >-
   Discover licensed c4dpy and create, inspect, validate, or copy durable Cinema 4D
   documents through a bounded headless process. No arbitrary Python execution.
 license: MIT
-compatibility: "Cinema 4D R21+ with licensed c4dpy; dcc-mcp-core 0.19.91+"
+compatibility: "Cinema 4D R21+ with licensed c4dpy; dcc-mcp-core 0.20.14+"
 allowed-tools: "python"
 metadata:
   dcc-mcp:

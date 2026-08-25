@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
-import signal
+import stat
 import subprocess
 import tempfile
 import time
@@ -13,6 +14,13 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from dcc_mcp_core.skills_helper import check_dcc_cancelled
+
+from ._process import (
+    ProcessCleanupError,
+    isolated_environment,
+    start_owned_process,
+    validate_timeout,
+)
 
 _DOCUMENT_SUFFIX = ".c4d"
 _IMPORT_SUFFIXES = {
@@ -75,6 +83,51 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _is_link_or_reparse(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    junction = getattr(path, "is_junction", None)
+    if callable(junction) and junction():
+        return True
+    try:
+        attributes = int(getattr(os.lstat(path), "st_file_attributes", 0))
+    except OSError:
+        return True
+    return bool(attributes & int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)))
+
+
+def _read_private_file(path: Path, maximum: int) -> bytes:
+    try:
+        if _is_link_or_reparse(path) or not path.is_file():
+            raise BridgeError("Cinema 4D returned an unsafe private artifact")
+        before = os.stat(path, follow_symlinks=False)
+        if before.st_size < 0 or before.st_size > maximum:
+            raise BridgeError("Cinema 4D private artifact exceeded its size limit")
+        payload = path.read_bytes()
+        after = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise BridgeError("Cinema 4D private artifact could not be inspected") from exc
+    if (
+        int(before.st_dev) != int(after.st_dev)
+        or int(before.st_ino) != int(after.st_ino)
+        or int(before.st_size) != int(after.st_size)
+        or len(payload) != int(before.st_size)
+    ):
+        raise BridgeError("Cinema 4D private artifact changed during inspection")
+    return payload
+
+
+def _write_ack_exclusive(path: Path) -> None:
+    try:
+        descriptor = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(b"ok\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError as exc:
+        raise BridgeError("Cinema 4D acknowledgement path is unsafe") from exc
+
+
 def _replace_staged_path(value: Any, staged: Path, final: Path) -> Any:
     if isinstance(value, dict):
         return {key: _replace_staged_path(item, staged, final) for key, item in value.items()}
@@ -101,8 +154,12 @@ class Cinema4dBridge:
         roots = list(allowed_roots or (Path.cwd(),))
         self.allowed_roots = tuple(Path(root).expanduser().resolve() for root in roots)
         self.max_input_bytes = max(1, int(max_input_bytes))
-        self.max_timeout_secs = max(1.0, float(max_timeout_secs))
+        maximum = float(max_timeout_secs)
+        if not math.isfinite(maximum) or maximum <= 0:
+            raise ValueError("max_timeout_secs must be a finite positive number")
+        self.max_timeout_secs = maximum
         self.driver_path = Path(__file__).with_name("cinema4d_driver.py").resolve()
+        self.executable_sha256 = _sha256_file(Path(self.executable)) if self.executable else None
 
     @classmethod
     def from_env(cls) -> "Cinema4dBridge":
@@ -144,6 +201,8 @@ class Cinema4dBridge:
                     )
                 )
         for candidate in candidates:
+            if candidate.is_symlink():
+                continue
             candidate = candidate.resolve()
             if candidate.is_dir():
                 options = (
@@ -152,18 +211,18 @@ class Cinema4dBridge:
                     candidate / "c4dpy.app" / "Contents" / "MacOS" / "c4dpy",
                 )
                 candidate = next((item for item in options if item.is_file()), candidate)
-            if candidate.is_file():
+            junction = getattr(candidate, "is_junction", None)
+            if candidate.is_file() and not (callable(junction) and junction()):
                 return str(candidate)
         return None
 
     def _timeout(self, value: float) -> float:
-        timeout = float(value)
-        if timeout <= 0 or timeout > self.max_timeout_secs:
+        try:
+            return validate_timeout(value, maximum=self.max_timeout_secs)
+        except ValueError as exc:
             raise BridgeError(
-                "timeout_secs must be greater than 0 and no more than %s"
-                % int(self.max_timeout_secs)
-            )
-        return timeout
+                "timeout_secs must be finite, positive, and within the configured maximum"
+            ) from exc
 
     def _path(self, value: str, suffixes: set[str], *, must_exist: bool) -> Path:
         path = Path(value).expanduser().resolve()
@@ -204,11 +263,20 @@ class Cinema4dBridge:
         if not self.driver_path.is_file():
             raise BridgeError("Packaged Cinema 4D driver is missing")
         timeout = self._timeout(timeout_secs)
-        with tempfile.TemporaryDirectory(prefix="dcc-mcp-cinema4d-") as temp_dir_value:
-            temp_dir = Path(temp_dir_value)
+        started = time.monotonic()
+        deadline = started + timeout
+        temp_dir = Path(tempfile.mkdtemp(prefix="dcc-mcp-cinema4d-"))
+        owned = None
+        primary: Optional[BaseException] = None
+        cleanup_error = False
+        try:
             request_path = temp_dir / "request.json"
             result_path = temp_dir / "result.json"
-            runtime_pid_path = temp_dir / "runtime.pid"
+            runtime_identity_path = temp_dir / "runtime.json"
+            runtime_ready_ack = temp_dir / "runtime-ready.ack"
+            runtime_result_ack = temp_dir / "runtime-result.ack"
+            stdout_path = temp_dir / "stdout.bin"
+            stderr_path = temp_dir / "stderr.bin"
             request_path.write_text(
                 json.dumps({"method": method, "params": dict(params)}, ensure_ascii=False),
                 encoding="utf-8",
@@ -218,90 +286,173 @@ class Cinema4dBridge:
                 str(self.driver_path),
                 str(request_path),
                 str(result_path),
-                str(runtime_pid_path),
+                str(runtime_identity_path),
+                str(runtime_ready_ack),
+                str(runtime_result_ack),
             ]
-            started = time.monotonic()
-            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-            with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stdout_file:
-                with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr_file:
-                    process = subprocess.Popen(
+            with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+                try:
+                    owned = start_owned_process(
                         command,
-                        cwd=str(temp_dir),
-                        env=os.environ.copy(),
-                        stdin=subprocess.DEVNULL,
+                        cwd=temp_dir,
+                        environment=isolated_environment(),
                         stdout=stdout_file,
                         stderr=stderr_file,
-                        text=True,
-                        creationflags=creationflags,
+                        deadline=deadline,
                     )
-                    try:
-                        deadline = started + timeout
-                        while not result_path.is_file():
-                            check_dcc_cancelled()
-                            if time.monotonic() >= deadline:
-                                raise BridgeTimeoutError(
-                                    "c4dpy exceeded the %.1f second timeout" % timeout
-                                )
-                            time.sleep(0.05)
-                    except BaseException:
-                        self._terminate_runtime(process, runtime_pid_path)
-                        raise
-                    if process.poll() is None:
-                        try:
-                            process.wait(timeout=5)
-                        except subprocess.TimeoutExpired:
-                            self._terminate_runtime(process, runtime_pid_path)
-                    stdout_file.seek(0)
-                    stderr_file.seek(0)
-                    stdout = stdout_file.read(65_537)
-                    stderr = stderr_file.read(65_537)
-            if not result_path.is_file():
-                raise BridgeError(
-                    "c4dpy did not return a result (exit %s): %s"
-                    % (process.returncode, (stderr or stdout).strip()[:1_000])
+                except subprocess.TimeoutExpired as exc:
+                    raise BridgeTimeoutError("c4dpy exceeded the configured timeout") from exc
+            runtime_identity: Optional[dict[str, Any]] = None
+            while not result_path.is_file():
+                check_dcc_cancelled()
+                if any(
+                    path.is_file() and path.stat().st_size > 65_536
+                    for path in (stdout_path, stderr_path)
+                ):
+                    raise BridgeError("Cinema 4D process output exceeded the configured limit")
+                if runtime_identity is None and runtime_identity_path.is_file():
+                    runtime_identity = self._acknowledge_runtime(
+                        runtime_identity_path,
+                        runtime_ready_ack,
+                        deadline=deadline,
+                        owned_process=owned,
+                    )
+                if time.monotonic() >= deadline:
+                    raise BridgeTimeoutError("c4dpy exceeded the configured timeout")
+                time.sleep(0.02)
+            if runtime_identity is None:
+                runtime_identity = self._acknowledge_runtime(
+                    runtime_identity_path,
+                    runtime_ready_ack,
+                    deadline=deadline,
+                    owned_process=owned,
                 )
-            if result_path.stat().st_size > 16 * 1024 * 1024:
-                raise BridgeError("Cinema 4D result exceeded the 16 MiB response limit")
-            payload = json.loads(result_path.read_text(encoding="utf-8"))
+            if time.monotonic() >= deadline:
+                raise BridgeTimeoutError("c4dpy exceeded the configured timeout")
+            self._recapture_runtime(runtime_identity)
+            if time.monotonic() >= deadline:
+                raise BridgeTimeoutError("c4dpy exceeded the configured timeout")
+            _write_ack_exclusive(runtime_result_ack)
+            stdout = _read_private_file(stdout_path, 65_537)
+            stderr = _read_private_file(stderr_path, 65_537)
+            if not result_path.is_file():
+                raise BridgeError("c4dpy did not return a result")
+            try:
+                payload = json.loads(
+                    _read_private_file(result_path, 16 * 1024 * 1024).decode("utf-8")
+                )
+            except (UnicodeError, ValueError) as exc:
+                raise BridgeError("Cinema 4D returned an invalid result") from exc
             if not payload.get("ok"):
                 error = payload.get("error") or {}
-                raise BridgeError(str(error.get("message") or "Cinema 4D operation failed"))
+                error_type = str(error.get("type") or "runtime_error")
+                if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.]{0,127}", error_type):
+                    error_type = "runtime_error"
+                raise BridgeError("Cinema 4D operation failed (%s)" % error_type)
             result = payload.get("result")
             if not isinstance(result, dict):
                 result = {"result": result}
+            project_source = params.get("document_path") or params.get("output_path")
             result.update(
                 {
                     "duration_secs": round(time.monotonic() - started, 3),
-                    "stdout": stdout[:65_536],
-                    "stderr": stderr[:65_536],
+                    "runtime_identity": runtime_identity,
+                    "listener_identity": "not_applicable_standalone",
+                    "project_identity": (
+                        hashlib.sha256(str(project_source).encode("utf-8")).hexdigest()
+                        if project_source
+                        else "no_project_for_status_probe"
+                    ),
+                    "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
+                    "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
                     "stdout_truncated": len(stdout) > 65_536,
                     "stderr_truncated": len(stderr) > 65_536,
                 }
             )
             return result
+        except BaseException as exc:
+            primary = exc
+        finally:
+            if owned is not None:
+                try:
+                    owned.close()
+                except ProcessCleanupError:
+                    cleanup_error = True
+            deadline = time.monotonic() + 3.0
+            while temp_dir.exists():
+                try:
+                    shutil.rmtree(temp_dir)
+                except FileNotFoundError:
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        cleanup_error = True
+                        break
+                    time.sleep(0.02)
+                else:
+                    break
+        if cleanup_error:
+            raise BridgeError("Cinema 4D process-tree cleanup could not be verified") from primary
+        if primary is not None:
+            raise primary
+        raise BridgeError("Cinema 4D operation did not produce a result")
 
-    @staticmethod
-    def _terminate_runtime(process: subprocess.Popen[str], runtime_pid_path: Path) -> None:
-        """Stop only the launcher and the runtime that acknowledged this request."""
-        runtime_pid = None
-        try:
-            if runtime_pid_path.is_file():
-                runtime_pid = int(runtime_pid_path.read_text(encoding="ascii").strip())
-        except (OSError, ValueError):
-            runtime_pid = None
+    def _acknowledge_runtime(
+        self,
+        identity_path: Path,
+        ack_path: Path,
+        *,
+        deadline: float,
+        expected_pid: Optional[int] = None,
+        owned_process: Optional[Any] = None,
+    ) -> dict[str, Any]:
+        identity: Any = None
+        while time.monotonic() < deadline:
+            try:
+                identity = json.loads(_read_private_file(identity_path, 64 * 1024).decode("utf-8"))
+                pid = int(identity["pid"])
+                protocol = int(identity["protocol"])
+            except (KeyError, TypeError, UnicodeError, ValueError):
+                time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+                continue
+            is_owned = (
+                owned_process.owns_pid(pid)
+                if owned_process is not None
+                else expected_pid is not None and pid == expected_pid
+            )
+            if protocol != 1 or not is_owned:
+                raise BridgeError("Cinema 4D runtime is not the owned process")
+            break
+        else:
+            raise BridgeTimeoutError("c4dpy exceeded the configured timeout")
+        if identity.get("executable") not in {None, self.executable}:
+            raise BridgeError("Cinema 4D runtime executable identity does not match")
+        from .install import _observe_bound_runtime
 
-        if runtime_pid and runtime_pid != os.getpid() and runtime_pid != process.pid:
-            try:
-                os.kill(runtime_pid, signal.SIGTERM)
-            except (OSError, ProcessLookupError):
-                pass
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
+        observed = _observe_bound_runtime(pid, self._host_identity_for_runtime())
+        _write_ack_exclusive(ack_path)
+        return observed
+
+    def _recapture_runtime(self, identity: Mapping[str, Any]) -> None:
+        from .install import _recapture_bound_runtime
+
+        _recapture_bound_runtime(identity, self._host_identity_for_runtime())
+
+    def _host_identity_for_runtime(self):
+        from .install import HostIdentity, _file_identity
+
+        if not self.executable or not self.executable_sha256:
+            raise BridgeError("Cinema 4D executable identity is unavailable")
+        path = Path(self.executable)
+        return HostIdentity(
+            path=path,
+            product="Maxon Cinema 4D",
+            product_version="runtime",
+            file_version="runtime",
+            sha256=self.executable_sha256,
+            size=path.stat().st_size,
+            file_identity=_file_identity(path),
+        )
 
     def _mutate_document(
         self,
