@@ -408,6 +408,47 @@ class _WindowsProcessTreeOwner(_ProcessTreeOwner):
             self._kernel32.CloseHandle(handle)
 
 
+def _terminate_windows_process_handle(process: Any, deadline: float) -> bool:
+    """Terminate and reap the exact Popen handle without reopening by PID."""
+    import ctypes
+    from ctypes import wintypes
+
+    wait_object = 0x00000000
+    wait_timeout = 0x00000102
+    wait_failed = 0xFFFFFFFF
+    handle = int(process._handle)
+    if not handle:
+        return False
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+
+    outcome = kernel32.WaitForSingleObject(handle, 0)
+    if outcome == wait_object:
+        return True
+    if outcome == wait_failed:
+        raise OSError(ctypes.get_last_error(), "exact process-handle wait failed")
+    if outcome != wait_timeout or time.monotonic() >= deadline:
+        return False
+    termination_error = None
+    if not kernel32.TerminateProcess(handle, 1):
+        termination_error = ctypes.get_last_error()
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return kernel32.WaitForSingleObject(handle, 0) == wait_object
+    wait_ms = max(1, min(0xFFFFFFFE, int(math.ceil(remaining * 1000.0))))
+    outcome = kernel32.WaitForSingleObject(handle, wait_ms)
+    if outcome == wait_object:
+        return True
+    if termination_error is not None:
+        raise OSError(termination_error, "exact process-handle termination failed")
+    if outcome == wait_failed:
+        raise OSError(ctypes.get_last_error(), "exact process-handle wait failed")
+    return False
+
+
 def _resume_windows_process(process: subprocess.Popen[Any]) -> None:
     import ctypes
     from ctypes import wintypes
@@ -733,28 +774,48 @@ def start_owned_process(
             # This cleanup-only budget can never turn the failed launch into a
             # success.  It only bounds exact-handle reaping after the caller's
             # operation deadline has already expired.
-            cleanup_deadline = time.monotonic() + _CLEANUP_SECS
+            try:
+                cleanup_deadline = time.monotonic() + _CLEANUP_SECS
+            except BaseException:
+                cleanup_deadline = operation_deadline
+            if process is not None and not assigned_to_job:
+                try:
+                    owner.assign(process)
+                    assigned_to_job = True
+                except BaseException:
+                    pass
             if assigned_to_job:
                 try:
                     owner.terminate()
-                except OSError:
-                    if process is not None and process.poll() is None:
-                        try:
-                            process.kill()
-                        except OSError:
-                            pass
-            elif process is not None and process.poll() is None:
-                try:
-                    process.kill()
-                except OSError:
+                except BaseException:
                     pass
             if process is not None:
                 try:
-                    process.wait(timeout=max(0.0, cleanup_deadline - time.monotonic()))
-                except (OSError, subprocess.TimeoutExpired):
+                    process_stopped = process.poll() is not None
+                except BaseException:
+                    process_stopped = False
+                if not process_stopped:
+                    try:
+                        process.kill()
+                    except BaseException:
+                        pass
+                try:
+                    _terminate_windows_process_handle(process, cleanup_deadline)
+                except BaseException:
                     pass
-            owner.wait_empty_until(operation_deadline)
-            owner.close()
+                try:
+                    remaining = max(0.0, cleanup_deadline - time.monotonic())
+                    process.wait(timeout=remaining)
+                except BaseException:
+                    pass
+            try:
+                owner.wait_empty_until(operation_deadline)
+            except BaseException:
+                pass
+            try:
+                owner.close()
+            except BaseException:
+                pass
             raise
     process = subprocess.Popen(list(command), **kwargs)
     return OwnedProcess(process, _ProcessTreeOwner())
