@@ -37,6 +37,7 @@ importers or exporters fail with a format-specific error.
 - Cinema 4D R21 or newer with a valid license.
 - The matching `c4dpy` executable shipped with that Cinema 4D installation.
 - Python 3.9 or newer for the DCC-MCP service.
+- `dcc-mcp-core>=0.20.14,<1.0.0` in the same Python distribution.
 
 Maxon documents that `c4dpy` is a headless Cinema 4D instance capable of loading,
 constructing, saving, and rendering scenes, but it requires a real Cinema 4D installation
@@ -44,12 +45,14 @@ and license.
 
 ## Install
 
-See [`install.md`](install.md) for the wheel-only agent path, platform
-discovery, JSON doctor contract, upgrade, uninstall, and troubleshooting.
+See [`install.md`](install.md) for the official Core Install SOP contract,
+identity-bound planning, atomic receipt, verification, upgrade, uninstall, and troubleshooting.
 
 ```bash
 python -m pip install dcc-mcp-cinema4d
-dcc-mcp-cinema4d doctor --json
+dcc-mcp-cinema4d plan --target install --c4dpy <absolute-c4dpy-path> --json
+dcc-mcp-cinema4d install --c4dpy <absolute-c4dpy-path> --json --yes
+dcc-mcp-cinema4d doctor --c4dpy <absolute-c4dpy-path> --json
 ```
 
 Set the licensed runtime and allowed workspace before starting the adapter:
@@ -66,8 +69,9 @@ For an explicit standalone readiness check:
 dcc-mcp-cinema4d verify --c4dpy "C:\Program Files\Maxon Cinema 4D 2026\c4dpy.exe" --json
 ```
 
-`c4dpy` is also discovered from `PATH` and common Maxon installation folders. The default
-allowed root is the adapter's current working directory.
+Lifecycle execution binds the exact Maxon product/file identity, digest, selected Python
+distribution, live PID/start token, and adapter-owned receipt. The default allowed root is
+the adapter's current working directory.
 
 ## Agent workflow
 

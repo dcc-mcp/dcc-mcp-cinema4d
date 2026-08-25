@@ -4,7 +4,7 @@ import json
 import math
 import os
 import sys
-import traceback
+import time
 
 
 def _vector(value, name, positive=False):
@@ -483,15 +483,32 @@ def dispatch(method, params):
     return handler(params)
 
 
+def _write_json_atomic(path, payload):
+    temporary = path + ".tmp"
+    with open(temporary, "x", encoding="utf-8") as stream:
+        json.dump(payload, stream, ensure_ascii=False)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def _wait_for_ack(path, timeout_secs=10.0):
+    deadline = time.monotonic() + timeout_secs
+    while not os.path.isfile(path):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("parent acknowledgement timed out")
+        time.sleep(0.01)
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    if len(argv) != 3:
-        raise SystemExit("usage: cinema4d_driver.py REQUEST_JSON RESULT_JSON RUNTIME_PID")
-    request_path, result_path, runtime_pid_path = argv
-    pid_temp_path = runtime_pid_path + ".tmp"
-    with open(pid_temp_path, "w", encoding="ascii") as stream:
-        stream.write(str(os.getpid()))
-    os.replace(pid_temp_path, runtime_pid_path)
+    if len(argv) != 5:
+        raise SystemExit(
+            "usage: cinema4d_driver.py REQUEST_JSON RESULT_JSON RUNTIME_JSON READY_ACK RESULT_ACK"
+        )
+    request_path, result_path, runtime_identity_path, ready_ack_path, result_ack_path = argv
+    _write_json_atomic(runtime_identity_path, {"pid": os.getpid(), "protocol": 1})
+    _wait_for_ack(ready_ack_path)
     try:
         with open(request_path, "r", encoding="utf-8") as stream:
             request = json.load(stream)
@@ -502,16 +519,10 @@ def main(argv=None):
             "ok": False,
             "error": {
                 "type": type(error).__name__,
-                "message": str(error),
-                "traceback": traceback.format_exc(limit=20),
             },
         }
-    result_temp_path = result_path + ".tmp"
-    with open(result_temp_path, "w", encoding="utf-8") as stream:
-        json.dump(payload, stream, ensure_ascii=False)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(result_temp_path, result_path)
+    _write_json_atomic(result_path, payload)
+    _wait_for_ack(result_ack_path)
     return 0 if payload["ok"] else 1
 
 

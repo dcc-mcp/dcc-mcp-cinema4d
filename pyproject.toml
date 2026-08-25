@@ -21,7 +21,7 @@ classifiers=[
   "Programming Language :: Python :: 3.12",
   "Operating System :: OS Independent",
 ]
-dependencies=["dcc-mcp-core>=0.19.91,<1.0.0"]
+dependencies=["dcc-mcp-core>=0.20.14,<1.0.0"]
 
 [project.urls]
 Homepage="https://github.com/dcc-mcp/dcc-mcp-cinema4d"
@@ -29,8 +29,8 @@ Repository="https://github.com/dcc-mcp/dcc-mcp-cinema4d"
 Issues="https://github.com/dcc-mcp/dcc-mcp-cinema4d/issues"
 
 [project.optional-dependencies]
-test=["pytest>=8","ruff>=0.8","PyYAML>=6"]
-dev=["pytest>=8","ruff>=0.8","PyYAML>=6","build>=1.2","twine>=6"]
+test=["pytest>=8","ruff>=0.8","PyYAML>=6","jsonschema>=4.23"]
+dev=["pytest>=8","ruff>=0.8","PyYAML>=6","jsonschema>=4.23","build>=1.2","twine>=6"]
 
 [project.scripts]
 dcc-mcp-cinema4d="dcc_mcp_cinema4d.server:main"

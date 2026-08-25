@@ -4,7 +4,7 @@ description: >-
   Create and transform typed Cinema 4D primitives, import geometry, export documents,
   and render images through an isolated c4dpy process. No arbitrary Python execution.
 license: MIT
-compatibility: "Cinema 4D R21+ with licensed c4dpy; dcc-mcp-core 0.19.91+"
+compatibility: "Cinema 4D R21+ with licensed c4dpy; dcc-mcp-core 0.20.14+"
 allowed-tools: "python"
 metadata:
   dcc-mcp:
