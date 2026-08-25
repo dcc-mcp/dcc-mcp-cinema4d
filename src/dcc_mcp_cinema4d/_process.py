@@ -715,12 +715,14 @@ def start_owned_process(
     if os.name == "nt":
         owner = _WindowsProcessTreeOwner()
         process = None
+        assigned_to_job = False
         try:
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | 0x00000004
             process = subprocess.Popen(list(command), creationflags=flags, **kwargs)
             if time.monotonic() >= operation_deadline:
                 raise subprocess.TimeoutExpired("owned process launch", 0)
             owner.assign(process)
+            assigned_to_job = True
             if time.monotonic() >= operation_deadline:
                 raise subprocess.TimeoutExpired("owned process launch", 0)
             _resume_windows_process(process)
@@ -728,15 +730,28 @@ def start_owned_process(
                 raise subprocess.TimeoutExpired("owned process launch", 0)
             return OwnedProcess(process, owner)
         except BaseException:
-            try:
-                owner.terminate()
-            except OSError:
-                if process is not None and process.poll() is None:
+            # This cleanup-only budget can never turn the failed launch into a
+            # success.  It only bounds exact-handle reaping after the caller's
+            # operation deadline has already expired.
+            cleanup_deadline = time.monotonic() + _CLEANUP_SECS
+            if assigned_to_job:
+                try:
+                    owner.terminate()
+                except OSError:
+                    if process is not None and process.poll() is None:
+                        try:
+                            process.kill()
+                        except OSError:
+                            pass
+            elif process is not None and process.poll() is None:
+                try:
                     process.kill()
+                except OSError:
+                    pass
             if process is not None:
                 try:
-                    process.wait(timeout=max(0.0, operation_deadline - time.monotonic()))
-                except subprocess.TimeoutExpired:
+                    process.wait(timeout=max(0.0, cleanup_deadline - time.monotonic()))
+                except (OSError, subprocess.TimeoutExpired):
                     pass
             owner.wait_empty_until(operation_deadline)
             owner.close()

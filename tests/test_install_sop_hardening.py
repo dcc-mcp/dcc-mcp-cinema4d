@@ -936,6 +936,44 @@ def test_windows_empty_job_and_exited_child_reject_expired_deadlines(
         owned.close(deadline=deadline)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="native Windows suspended-launch contract")
+def test_windows_deadline_before_job_assignment_kills_the_exact_suspended_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [100.0]
+    launched = []
+    real_popen = process_support.subprocess.Popen
+
+    def delayed_popen(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        launched.append(process)
+        clock[0] = 100.1
+        return process
+
+    monkeypatch.setattr(process_support.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(process_support.subprocess, "Popen", delayed_popen)
+
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            process_support.start_owned_process(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                cwd=tmp_path,
+                environment=process_support.isolated_environment(),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                deadline=100.05,
+            )
+
+        assert len(launched) == 1
+        assert launched[0].poll() is not None
+        assert not _pid_alive(launched[0].pid)
+    finally:
+        for process in launched:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=3.0)
+
+
 def test_owned_command_bounds_process_output_without_returning_raw_bytes() -> None:
     script = "import sys; sys.stdout.write('x' * 70000); sys.stdout.flush()"
 
