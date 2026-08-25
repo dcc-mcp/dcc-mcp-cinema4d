@@ -356,7 +356,7 @@ def test_macos_process_group_accounting_is_exact_and_fail_closed(
         returncode=returncode,
     )
 
-    assert process_support._darwin_group_has_live_members(12345) is expected
+    assert process_support._darwin_group_has_live_members(12345, time.monotonic() + 3.0) is expected
 
 
 def test_macos_process_group_timeout_is_fail_closed(
@@ -371,7 +371,7 @@ def test_macos_process_group_timeout_is_fail_closed(
     monkeypatch.setattr(process_support, "_DARWIN_PS_PATHS", (fake_ps,))
     monkeypatch.setattr(process_support.subprocess, "run", fake_run)
 
-    assert process_support._darwin_group_has_live_members(12345, 0.05) is True
+    assert process_support._darwin_group_has_live_members(12345, time.monotonic() + 0.05) is True
 
 
 def test_macos_process_group_falls_back_to_the_sess_column(
@@ -389,7 +389,7 @@ def test_macos_process_group_falls_back_to_the_sess_column(
     monkeypatch.setattr(process_support, "_DARWIN_PS_PATHS", (fake_ps,))
     monkeypatch.setattr(process_support.subprocess, "run", fake_run)
 
-    assert process_support._darwin_group_has_live_members(12345) is False
+    assert process_support._darwin_group_has_live_members(12345, time.monotonic() + 3.0) is False
     assert observed == [
         [str(fake_ps), "-axo", "pid=,pgid=,sid=,state="],
         [str(fake_ps), "-axo", "pid=,pgid=,sess=,state="],
@@ -435,7 +435,7 @@ def test_macos_process_group_ignores_zombies_from_bounded_ps(
         stdout="24680 12345 12345 Z\n",
     )
 
-    assert process_support._darwin_group_has_live_members(12345) is False
+    assert process_support._darwin_group_has_live_members(12345, time.monotonic() + 3.0) is False
     assert observed
     assert observed[0][0] == [str(fake_ps), "-axo", "pid=,pgid=,sid=,state="]
     assert observed[0][1] > 0
@@ -450,11 +450,119 @@ def test_macos_process_group_preserves_a_partially_consumed_deadline(
         monkeypatch,
         stdout="24680 12345 12345 Z\n",
     )
-    ticks = iter((100.0, 100.75))
-    monkeypatch.setattr(process_support.time, "monotonic", lambda: next(ticks))
+    clock = [100.75]
+    monkeypatch.setattr(process_support.time, "monotonic", lambda: clock[0])
 
-    assert process_support._darwin_group_has_live_members(12345) is False
+    assert process_support._darwin_group_has_live_members(12345, 103.0) is False
     assert observed == [([str(fake_ps), "-axo", "pid=,pgid=,sid=,state="], pytest.approx(2.25))]
+
+
+def test_darwin_wait_empty_threads_the_exact_caller_deadline_into_ps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [100.0]
+    observed = []
+    fake_ps = tmp_path / "ps"
+    fake_ps.write_bytes(b"")
+
+    class FakeProcess:
+        pid = 12345
+
+        @staticmethod
+        def poll():
+            return -9
+
+    def failing_ps(_command, **kwargs):
+        observed.append(float(kwargs["timeout"]))
+        clock[0] = 103.1
+        raise OSError("synthetic ps failure")
+
+    original_probe = process_support._darwin_group_has_live_members
+
+    def delayed_probe(process_group, deadline):
+        clock[0] = 100.75
+        return original_probe(process_group, deadline)
+
+    owner = process_support._PosixProcessTreeOwner(FakeProcess())
+    monkeypatch.setattr(process_support.sys, "platform", "darwin")
+    monkeypatch.setattr(process_support.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(process_support, "_DARWIN_PS_PATHS", (fake_ps,))
+    monkeypatch.setattr(process_support.subprocess, "run", failing_ps)
+    monkeypatch.setattr(process_support, "_darwin_group_has_live_members", delayed_probe)
+
+    assert owner.wait_empty_until(103.0) is False
+    assert observed == [pytest.approx(2.25)]
+
+
+def test_darwin_group_cannot_certify_empty_after_the_caller_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [100.0]
+    fake_ps = tmp_path / "ps"
+    fake_ps.write_bytes(b"")
+
+    def delayed_ps(command, **_kwargs):
+        clock[0] = 103.1
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(process_support.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(process_support, "_DARWIN_PS_PATHS", (fake_ps,))
+    monkeypatch.setattr(process_support.subprocess, "run", delayed_ps)
+
+    assert process_support._darwin_group_has_live_members(12345, 103.0) is True
+
+
+def test_base_owner_cannot_certify_an_empty_tree_after_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(process_support.time, "monotonic", lambda: 100.0)
+
+    assert process_support._ProcessTreeOwner().wait_empty_until(100.0) is False
+
+
+def test_posix_missing_group_cannot_certify_success_after_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProcess:
+        pid = 12345
+
+        @staticmethod
+        def poll():
+            return -9
+
+    owner = process_support._PosixProcessTreeOwner(FakeProcess())
+    monkeypatch.setattr(process_support.sys, "platform", "linux")
+    monkeypatch.setattr(process_support.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(
+        process_support.os,
+        "killpg",
+        lambda *_args: (_ for _ in ()).throw(ProcessLookupError()),
+        raising=False,
+    )
+
+    assert owner.wait_empty_until(100.0) is False
+
+
+def test_owned_process_cannot_certify_cleanup_after_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ExitedProcess:
+        returncode = 0
+
+        @staticmethod
+        def poll():
+            return 0
+
+        @staticmethod
+        def wait(*, timeout):
+            assert timeout == 0.0
+            return 0
+
+    monkeypatch.setattr(process_support.time, "monotonic", lambda: 100.0)
+    owned = process_support.OwnedProcess(ExitedProcess(), process_support._ProcessTreeOwner())
+
+    with pytest.raises(process_support.ProcessCleanupError):
+        owned.close(deadline=100.0)
 
 
 def test_runtime_ready_receipt_rejects_a_foreign_or_forged_pid(
@@ -805,6 +913,27 @@ def test_owned_timeout_terminates_root_descendant_and_inherited_handles(tmp_path
         time.sleep(0.05)
     assert not _pid_alive(identities["root"])
     assert not _pid_alive(identities["child"])
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows Job deadline contract")
+@pytest.mark.parametrize("deadline_offset", [0.0, -1.0])
+def test_windows_empty_job_and_exited_child_reject_expired_deadlines(
+    tmp_path: Path, deadline_offset: float
+) -> None:
+    owned = process_support.start_owned_process(
+        [sys.executable, "-c", "pass"],
+        cwd=tmp_path,
+        environment=process_support.isolated_environment(),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        deadline=time.monotonic() + 5.0,
+    )
+    owned.process.wait(timeout=3.0)
+    deadline = time.monotonic() + deadline_offset
+
+    assert owned.owner.wait_empty_until(deadline) is False
+    with pytest.raises(process_support.ProcessCleanupError):
+        owned.close(deadline=deadline)
 
 
 def test_owned_command_bounds_process_output_without_returning_raw_bytes() -> None:
