@@ -180,8 +180,10 @@ def _darwin_group_has_live_members(process_group: int) -> bool:
         libproc.proc_pidinfo.restype = ctypes.c_int
         pids = (ctypes.c_int * 4096)()
         used = libproc.proc_listpids(2, process_group, pids, ctypes.sizeof(pids))
-        if used <= 0:
+        if used < 0:
             return True
+        if used == 0:
+            return False
         for pid in pids[: used // ctypes.sizeof(ctypes.c_int)]:
             if pid <= 0:
                 continue

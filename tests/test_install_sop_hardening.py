@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 from jsonschema import Draft202012Validator
 
+from dcc_mcp_cinema4d import _process as process_support
 from dcc_mcp_cinema4d import install as installer
 from dcc_mcp_cinema4d.bridge import BridgeError, Cinema4dBridge
 
@@ -306,6 +307,30 @@ def test_macos_runtime_identity_uses_kernel_microseconds() -> None:
     assert 0 <= int(microseconds) < 1_000_000
     assert identity["executable_sha256"]
     assert identity["executable_file_identity"]
+
+
+@pytest.mark.parametrize(("listed_bytes", "expected"), [(0, False), (-1, True)])
+def test_macos_process_group_listing_distinguishes_empty_from_error(
+    monkeypatch: pytest.MonkeyPatch, listed_bytes: int, expected: bool
+) -> None:
+    import ctypes
+
+    class FakeFunction:
+        def __init__(self, result: int) -> None:
+            self.result = result
+            self.argtypes = None
+            self.restype = None
+
+        def __call__(self, *_args: object) -> int:
+            return self.result
+
+    class FakeLibproc:
+        proc_listpids = FakeFunction(listed_bytes)
+        proc_pidinfo = FakeFunction(-1)
+
+    monkeypatch.setattr(ctypes, "CDLL", lambda _path: FakeLibproc())
+
+    assert process_support._darwin_group_has_live_members(12345) is expected
 
 
 def test_runtime_ready_receipt_rejects_a_foreign_or_forged_pid(
