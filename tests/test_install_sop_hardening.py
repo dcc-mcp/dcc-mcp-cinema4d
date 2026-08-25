@@ -446,7 +446,7 @@ def test_owned_timeout_terminates_root_descendant_and_inherited_handles(tmp_path
         "time.sleep(60)"
     )
 
-    result = installer._run_owned_command([sys.executable, "-c", root_script], timeout_secs=0.5)
+    result = installer._run_owned_command([sys.executable, "-c", root_script], timeout_secs=2.0)
 
     assert result["success"] is False
     assert result["reason"] == "process timed out"
