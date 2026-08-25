@@ -115,7 +115,7 @@ def test_output_overwrite_requires_opt_in(tmp_path):
 
 
 def test_packaged_driver_rejects_unknown_methods(tmp_path):
-    executable = getattr(sys, "_base_executable", sys.executable)
+    executable = str(Path(getattr(sys, "_base_executable", sys.executable)).resolve())
     bridge = Cinema4dBridge(executable=executable, allowed_roots=[tmp_path])
 
     with pytest.raises(BridgeError, match="Cinema 4D operation failed"):
@@ -130,7 +130,7 @@ def test_bridge_waits_when_executable_launches_worker_and_exits(tmp_path):
         "subprocess.Popen([sys.executable, %r, *sys.argv[1:]])\n" % str(driver),
         encoding="utf-8",
     )
-    executable = getattr(sys, "_base_executable", sys.executable)
+    executable = str(Path(getattr(sys, "_base_executable", sys.executable)).resolve())
     bridge = Cinema4dBridge(executable=executable, allowed_roots=[tmp_path])
     bridge.driver_path = launcher
 

@@ -107,6 +107,9 @@ class _PosixProcessTreeOwner(_ProcessTreeOwner):
     def wait_empty(self, timeout: float) -> bool:
         deadline = time.monotonic() + max(0.0, timeout)
         while True:
+            # Reap the supervisor before probing its process group.  A dead but
+            # unreaped leader remains visible to killpg(0) on POSIX.
+            self.process.poll()
             try:
                 os.killpg(self.process.pid, 0)
             except ProcessLookupError:
