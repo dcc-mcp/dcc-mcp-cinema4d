@@ -500,6 +500,21 @@ def _wait_for_ack(path, timeout_secs=10.0):
         time.sleep(0.01)
 
 
+def _host_build():
+    """The Cinema 4D build, attached to every result.
+
+    Post-write read-back failures are the classic signature of host API drift,
+    so the build travels with each result instead of being probed separately:
+    without it a mismatch report cannot be reproduced.
+    """
+    try:
+        import c4d
+
+        return int(c4d.GetC4DVersion())
+    except Exception:
+        return None
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if len(argv) != 5:
@@ -513,13 +528,14 @@ def main(argv=None):
         with open(request_path, "r", encoding="utf-8") as stream:
             request = json.load(stream)
         result = dispatch(str(request.get("method", "")), request.get("params", {}))
-        payload = {"ok": True, "result": result}
+        payload = {"ok": True, "result": result, "cinema4d_version": _host_build()}
     except BaseException as error:
         payload = {
             "ok": False,
             "error": {
                 "type": type(error).__name__,
             },
+            "cinema4d_version": _host_build(),
         }
     _write_json_atomic(result_path, payload)
     _wait_for_ack(result_ack_path)

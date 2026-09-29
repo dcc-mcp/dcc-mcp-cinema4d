@@ -27,19 +27,35 @@ from dcc_mcp_core.deployment import (
     INSTALL_EXIT_OK,
     INSTALL_EXIT_PREFLIGHT,
     INSTALL_EXIT_VERIFY,
-    INSTALL_SOP_SCHEMA_VERSION,
     load_install_sop_schema,
 )
 
 from .__version__ import __version__
 from ._process import isolated_environment, run_owned_command, validate_timeout
 from .bridge import BridgeError, BridgeTimeoutError, Cinema4dBridge
+from .compat import (
+    SUPPORTED,
+    classify_host,
+    remediation_steps,
+    unsupported_reason,
+)
 
 DCC_TYPE = "c4d"
 COMMAND = "dcc-mcp-cinema4d"
-MINIMUM_CORE_VERSION = "0.20.14"
+MINIMUM_CORE_VERSION = "0.20.36"
 MINIMUM_HOST_BUILD = 21_000
 MAX_TIMEOUT_SECS = 1_800.0
+
+# The published Install SOP schema is an immutable artifact that is revisioned
+# (`adapter-install-sop-vN.schema.json`). `INSTALL_SOP_SCHEMA_VERSION` is that
+# artifact revision; it is deliberately *not* the report document's own
+# `schema_version` field, which stayed at 1 when the artifact moved to v2.
+# Emitting the artifact revision here produces a report the schema itself
+# rejects, so the report field is always read back from the schema.
+_REPORT_SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
+_SUPPORTED_REPORT_SCHEMA_VERSIONS = (1,)
+_FALLBACK_REPORT_SCHEMA_VERSION = 1
+_CACHED_REPORT_SCHEMA_VERSION: Optional[int] = None
 
 _STATE_ENV = "DCC_MCP_CINEMA4D_STATE_DIR"
 _LOCK_GUARD = threading.Lock()
@@ -123,18 +139,44 @@ def _require_deadline(deadline: float) -> None:
         )
 
 
-def _require_official_core_contract() -> None:
+def _report_schema_version() -> int:
+    """Return the Install SOP report's own ``schema_version``.
+
+    The value is read from the published schema's ``const`` rather than from
+    ``INSTALL_SOP_SCHEMA_VERSION``, because the latter tracks the schema
+    *artifact* revision and not this field. When the artifact moved to v2 the
+    report field stayed at 1, so reusing the constant emitted ``2`` and every
+    report failed the very schema it was validated against.
+
+    The result is cached because :func:`load_install_sop_schema` re-reads and
+    re-verifies the artifact on every call.
+    """
+    global _CACHED_REPORT_SCHEMA_VERSION
+    if _CACHED_REPORT_SCHEMA_VERSION is not None:
+        return _CACHED_REPORT_SCHEMA_VERSION
     try:
         schema = load_install_sop_schema()
         version = schema["properties"]["schema_version"]["const"]
-    except (KeyError, OSError, TypeError, ValueError) as exc:
+    except (KeyError, OSError, TypeError, ValueError):
+        return _FALLBACK_REPORT_SCHEMA_VERSION
+    if not isinstance(version, int) or isinstance(version, bool):
+        return _FALLBACK_REPORT_SCHEMA_VERSION
+    _CACHED_REPORT_SCHEMA_VERSION = version
+    return version
+
+
+def _require_official_core_contract() -> None:
+    try:
+        schema = load_install_sop_schema()
+    except (OSError, TypeError, ValueError) as exc:
         raise LifecycleFailure(
             "core_contract", "The official Core Install SOP schema is unavailable."
         ) from exc
-    if (
-        schema.get("$schema") != "https://json-schema.org/draft/2020-12/schema"
-        or version != INSTALL_SOP_SCHEMA_VERSION
-    ):
+    if schema.get("$schema") != _REPORT_SCHEMA_DIALECT:
+        raise LifecycleFailure(
+            "core_contract", "The official Core Install SOP schema is incompatible."
+        )
+    if _report_schema_version() not in _SUPPORTED_REPORT_SCHEMA_VERSIONS:
         raise LifecycleFailure(
             "core_contract", "The official Core Install SOP schema is incompatible."
         )
@@ -1110,15 +1152,14 @@ def _verify_runtime(context: InstallContext, deadline: float) -> dict[str, Any]:
             "failure_stage": "runtime_identity",
             "failure_reason": "Cinema 4D runtime identity was not verified.",
         }
-    try:
-        host_build = int(runtime.get("cinema4d_version", 0))
-    except (TypeError, ValueError):
-        host_build = 0
-    if host_build < MINIMUM_HOST_BUILD:
+    verdict = classify_host(runtime.get("cinema4d_version"), runtime.get("python_version") or None)
+    if verdict["status"] != SUPPORTED:
         return {
             "directly_usable": False,
             "failure_stage": "host_version",
-            "failure_reason": "Cinema 4D R21 or newer is required.",
+            "failure_reason": unsupported_reason(verdict),
+            "host_matrix": verdict,
+            "next_steps": remediation_steps(verdict),
         }
     _recapture_host(context)
     receipt_identity = _recapture_receipt(context)
@@ -1138,6 +1179,7 @@ def _verify_runtime(context: InstallContext, deadline: float) -> dict[str, Any]:
         "receipt_identity": (
             None if receipt_identity is None else receipt_identity.rsplit("sha256:", 1)[-1]
         ),
+        "host_matrix": verdict,
     }
 
 
@@ -1152,7 +1194,7 @@ def _public_result(
 ) -> dict[str, Any]:
     core = context.python.core_version if context else _core_version()
     result = {
-        "schema_version": INSTALL_SOP_SCHEMA_VERSION,
+        "schema_version": _report_schema_version(),
         "status": status,
         "dcc_type": DCC_TYPE,
         "adapter_version": __version__,
@@ -1196,6 +1238,7 @@ def _public_result(
             "listener_identity",
             "project_identity",
             "receipt_identity",
+            "host_matrix",
         ):
             if key in verify:
                 result[key] = verify[key]
@@ -1345,6 +1388,7 @@ def _mutate(
                     {"id": "install", "status": "already_current"},
                     {"id": "verify", "status": "ok" if status == "ok" else "failed"},
                 ],
+                next_steps=verify.get("next_steps"),
             )
             return LifecycleOutcome(
                 result, INSTALL_EXIT_OK if status == "ok" else INSTALL_EXIT_VERIFY
@@ -1376,6 +1420,7 @@ def _mutate(
                     {"id": request.operation, "status": "rolled_back"},
                     {"id": "verify", "status": "failed"},
                 ],
+                next_steps=verify.get("next_steps"),
             )
             result["previous_restored"] = True
             _require_deadline(deadline)
@@ -1472,6 +1517,7 @@ def run_lifecycle(
                 status=status,
                 verify=verify,
                 steps=[{"id": "verify", "status": status}],
+                next_steps=verify.get("next_steps"),
             )
             return LifecycleOutcome(
                 result, INSTALL_EXIT_OK if status == "ok" else INSTALL_EXIT_VERIFY

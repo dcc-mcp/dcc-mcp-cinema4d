@@ -37,11 +37,44 @@ importers or exporters fail with a format-specific error.
 - Cinema 4D R21 or newer with a valid license.
 - The matching `c4dpy` executable shipped with that Cinema 4D installation.
 - Python 3.9 or newer for the DCC-MCP service.
-- `dcc-mcp-core>=0.20.14,<1.0.0` in the same Python distribution.
+- `dcc-mcp-core>=0.20.36,<1.0.0` in the same Python distribution.
 
 Maxon documents that `c4dpy` is a headless Cinema 4D instance capable of loading,
 constructing, saving, and rendering scenes, but it requires a real Cinema 4D installation
 and license.
+
+## Two interpreters
+
+The adapter spans two Python runtimes. Most setup confusion comes from mixing them up:
+
+| Side | Interpreter | Floor | Runs |
+| --- | --- | --- | --- |
+| Service | the Python the adapter is installed into | 3.9 | MCP server, `install`/`doctor`/`verify`, path and timeout policy, bridge |
+| Host | the Python **inside `c4dpy`** | 3 | the packaged driver, which imports `c4d` and touches the scene |
+
+The service floor is this package's `requires-python`. The host floor is decided by
+whichever interpreter that Cinema 4D build ships, and releases whose `c4dpy` is
+Python 2.7 (the R21 and R22 lines) cannot run the driver. That makes R23 the effective
+floor in practice, even though the build floor is R21.
+
+`doctor --json` reports both: `checks.runtime.python_version` is the host side, and
+`plan.python.version` is the service side.
+
+## Host versions and read-back
+
+Declared support lives in `src/dcc_mcp_cinema4d/compat_matrix.json`, shipped in the wheel
+and keyed on the integer from `c4d.GetC4DVersion()`. `doctor` and `verify` embed the
+verdict as `host_matrix`; a build outside the matrix is rejected explicitly rather than
+treated as "close enough".
+
+Every mutating tool reads its change back before reporting success — document mutations
+against the reopened document, exports against their format signature, renders against the
+requested dimensions — and a mismatch raises an error naming the tool, the check, both
+values, and the Cinema 4D build.
+
+CI runs `pytest -m "not cinema4d"`, so its evidence is **contract level**: the read-back
+logic is proven, Cinema 4D's behaviour is not. Host-level evidence comes only from the
+opt-in real-host test on a licensed machine. See [`install.md`](install.md).
 
 ## Install
 
@@ -98,7 +131,14 @@ python -m twine check dist/*
 ```
 
 Real-host acceptance requires a licensed `c4dpy`; CI intentionally does not mock a Maxon
-license.
+license. On a licensed machine:
+
+```bash
+C4D_TEST_EXECUTABLE=/path/to/c4dpy python -m pytest -m cinema4d
+```
+
+That is the only host-level evidence this adapter produces, and it is opt-in precisely
+because the license cannot be provisioned on a hosted runner.
 
 Official references: [c4dpy manual](https://developers.maxon.net/docs/py/2025_1_0/manuals/manual_py_c4dpy.html),
 [Cinema 4D Python SDK](https://developers.maxon.net/docs/py/index.html).
