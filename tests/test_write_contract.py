@@ -73,8 +73,11 @@ def test_transform_matches_reports_a_partial_transform_as_matching() -> None:
         (".glb", b"glTF\x02\x00\x00\x00rest", True),
         (".glb", b"not-a-gltf-file", False),
         (".fbx", b"Kaydara FBX Binary  \x00rest", True),
+        (".fbx", b"; FBX 7.4.0 project file\nFBXVersion: 7400\n", True),
+        (".fbx", b"FBXVersion: 7400\n", True),
         (".fbx", b"not-an-fbx-file", False),
         (".dae", b'<?xml version="1.0"?><COLLADA/>', True),
+        (".dae", b"<COLLADA/>", True),  # the XML declaration is optional
         (".dae", b"<html/>", False),
         (".obj", b"# comment\nv 0 0 0\nv 1 0 0\n", True),
         (".obj", b"# comment only\n", False),
@@ -90,6 +93,28 @@ def test_file_signature_matches(
     matches, _detail = write_contract.file_signature_matches(str(target), suffix)
 
     assert matches is expected
+
+
+def test_signature_check_tolerates_a_leading_preamble(tmp_path: Path) -> None:
+    """A BOM or leading whitespace is not a format mismatch."""
+    target = tmp_path / "scene.gltf"
+    target.write_bytes(b"\xef\xbb\xbf  \n" + b'{"asset":{"version":"2.0"}}')
+
+    assert write_contract.file_signature_matches(str(target), ".gltf")[0] is True
+
+
+def test_signature_check_accepts_every_encoding_cinema4d_may_write(tmp_path: Path) -> None:
+    """Cinema 4D exports binary *or* ASCII FBX; rejecting either would be wrong.
+
+    The check targets a wrong, empty, or placeholder artifact. Enforcing one
+    encoding would fail valid exports, which is a worse outcome than a weaker
+    check.
+    """
+    for payload in (b"Kaydara FBX Binary  \x00\x1a\x00", b"; FBX 7.4.0 project file\n"):
+        target = tmp_path / "model.fbx"
+        target.write_bytes(payload)
+
+        assert write_contract.file_signature_matches(str(target), ".fbx")[0] is True
 
 
 def test_stl_signatures_cover_ascii_and_binary(tmp_path: Path) -> None:

@@ -93,15 +93,23 @@ TOOL_CLASSIFICATION_ERROR = (
 # Exported formats whose leading bytes identify them. A suffix absent from this
 # table is verified by size only, and that weaker level is recorded rather than
 # being presented as a full read-back.
+# Accepted leading bytes per export suffix. Several formats have more than one
+# legitimate encoding — Cinema 4D writes binary *or* ASCII FBX, and a Collada
+# file may omit the XML declaration — so each entry is a tuple of alternatives.
+# The check exists to catch a wrong, empty, or placeholder artifact, not to
+# enforce one encoding: a false rejection of a valid export is a worse outcome
+# than a weaker check, so an unfamiliar encoding is not treated as a mismatch.
 _FILE_SIGNATURES = {
     ".glb": (b"glTF",),
     ".gltf": (b"{",),
-    ".fbx": (b"Kaydara FBX Binary",),
-    ".dae": (b"<?xml",),
+    ".fbx": (b"Kaydara FBX Binary", b"; FBX", b"FBXVersion"),
+    ".dae": (b"<?xml", b"<COLLADA", b"<collada"),
     ".stl": (b"solid",),
 }
 
 _TEXT_VERTEX_PREFIXES = (".obj",)
+
+_UTF8_BOM = b"\xef\xbb\xbf"
 
 
 def jsonable(value):
@@ -235,6 +243,12 @@ def file_signature_matches(path: str, suffix: str) -> Tuple[bool, Optional[str]]
         return False, "the written file could not be re-read: %s" % exc
     if not header:
         return False, "the written file is empty"
+    # Text-based containers may carry an XML declaration, a BOM, or leading
+    # whitespace; the shape being checked for is the format, not the encoding's
+    # preamble.
+    header = header.lstrip()
+    if header.startswith(_UTF8_BOM):
+        header = header[len(_UTF8_BOM) :].lstrip()
     if not header.startswith(signatures):
         return False, "the file does not start with a %s signature" % lowered
     return True, None
