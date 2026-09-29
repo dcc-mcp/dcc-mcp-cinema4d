@@ -52,7 +52,9 @@ pythonpath=["src","."]
 markers=["cinema4d: requires a real licensed c4dpy runtime"]
 
 [tool.ruff.lint]
-select=["E","F","I","B"]
+# FA catches PEP 604 unions (`dict | None`) written without
+# `from __future__ import annotations`, which raise at runtime on Python 3.9.
+select=["E","F","I","B","FA"]
 
 [tool.ruff]
 line-length=100
