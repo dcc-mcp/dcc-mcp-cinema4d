@@ -67,3 +67,28 @@ def test_public_sources_do_not_expose_arbitrary_python():
     ).lower()
     assert "exec(" not in text
     assert "eval(" not in text
+
+
+def test_the_cinema4d_marker_is_not_an_empty_promise():
+    """The marker is declared and CI excludes it, so it must have a user.
+
+    An unused marker is worse than no marker: it advertises real-host capability
+    the repo does not have. Either a test carries it or the declaration goes.
+    """
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert 'markers=["cinema4d:' in pyproject
+
+    users = [
+        path.name
+        for path in (ROOT / "tests").glob("*.py")
+        if "pytest.mark.cinema4d" in path.read_text(encoding="utf-8")
+    ]
+
+    assert users, "no test uses the cinema4d marker; delete the marker instead"
+
+
+def test_ci_excludes_the_real_host_marker():
+    """Real-host tests are opt-in; CI must keep running contract-level only."""
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+    assert '-m "not cinema4d"' in ci

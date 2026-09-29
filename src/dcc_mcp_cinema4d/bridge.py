@@ -15,12 +15,14 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from dcc_mcp_core.skills_helper import check_dcc_cancelled
 
+from . import write_contract
 from ._process import (
     ProcessCleanupError,
     isolated_environment,
     start_owned_process,
     validate_timeout,
 )
+from .compat import classify_host
 
 _DOCUMENT_SUFFIX = ".c4d"
 _IMPORT_SUFFIXES = {
@@ -53,6 +55,20 @@ class BridgeError(RuntimeError):
 
 class BridgeTimeoutError(BridgeError):
     """c4dpy exceeded the configured deadline."""
+
+
+class WriteVerificationError(BridgeError):
+    """A mutating tool reported success but the read-back disagreed.
+
+    Subclasses :class:`BridgeError` so existing callers keep handling every
+    bounded failure the same way, while :attr:`payload` carries the structured
+    ``tool`` / ``check`` / ``expected`` / ``actual`` / ``host_build`` mismatch
+    for callers that want to branch instead of parsing prose.
+    """
+
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+        super().__init__(write_contract.format_message(payload))
 
 
 def _within(path: Path, roots: Sequence[Path]) -> bool:
@@ -404,6 +420,9 @@ class Cinema4dBridge:
                     "stderr_truncated": len(stderr) > 65_536,
                 }
             )
+            reported_build = payload.get("cinema4d_version")
+            if reported_build is not None:
+                result["cinema4d_version"] = reported_build
             _require_deadline(deadline)
             completed_result = result
         except BaseException as exc:
@@ -510,6 +529,229 @@ class Cinema4dBridge:
             file_identity=_file_identity(path),
         )
 
+    def _verification_context(self, result: Mapping[str, Any]) -> dict[str, Any]:
+        """Host build and matrix status, attached to every read-back mismatch.
+
+        A read-back that disagrees is the classic signature of host API drift,
+        so the report has to say which build produced it.
+        """
+        build = result.get("cinema4d_version")
+        context: dict[str, Any] = {"host_build": build, "host_matrix": None}
+        if build is not None:
+            try:
+                context["host_matrix"] = classify_host(build)
+            except (OSError, ValueError):
+                context["host_matrix"] = None
+        return context
+
+    def _fail_read_back(
+        self,
+        tool: str,
+        check: str,
+        expected: Any,
+        actual: Any,
+        result: Mapping[str, Any],
+        params: Optional[Mapping[str, Any]] = None,
+        remediation: Optional[str] = None,
+    ) -> None:
+        payload = {
+            "schema_version": write_contract.SCHEMA_VERSION,
+            "tool": tool,
+            "check": check,
+            "expected": write_contract.jsonable(expected),
+            "actual": write_contract.jsonable(actual),
+            "params": write_contract.jsonable(params),
+            "remediation": remediation,
+        }
+        payload.update(self._verification_context(result))
+        raise WriteVerificationError(payload)
+
+    def _verify_document_change(
+        self,
+        method: str,
+        params: Mapping[str, Any],
+        result: dict[str, Any],
+        durable: Mapping[str, Any],
+        timeout_secs: float,
+    ) -> None:
+        """Prove the reopened document actually contains this call's change.
+
+        The driver's own payload only shows what it built in memory. ``durable``
+        is the document re-read from disk after the save, so it is the only
+        evidence that the change survived. Comparing them costs no extra c4dpy
+        launch: the bridge already reopens the document to report ``document``.
+        """
+        if method == "model.add_primitive":
+            name = str(params.get("name", ""))
+            found = write_contract.find_object(durable, name)
+            if found is None:
+                self._fail_read_back(
+                    method,
+                    "object_present",
+                    name,
+                    write_contract.object_paths(durable),
+                    result,
+                    params,
+                    remediation="The primitive was created in memory but is absent from the "
+                    "reopened document, so the save did not persist it.",
+                )
+            expected = write_contract.expected_transform(params)
+            if not write_contract.transform_matches(expected, found.get("transform")):
+                self._fail_read_back(
+                    method, "transform", expected, found.get("transform"), result, params
+                )
+            live = result.get("created")
+            if (
+                isinstance(live, dict)
+                and live.get("type_id") is not None
+                and live.get("type_id") != found.get("type_id")
+            ):
+                self._fail_read_back(
+                    method, "type_id", live.get("type_id"), found.get("type_id"), result, params
+                )
+        elif method == "model.transform_object":
+            name = str(params.get("object_name", ""))
+            found = write_contract.find_object(durable, name)
+            if found is None:
+                self._fail_read_back(
+                    method,
+                    "object_present",
+                    name,
+                    write_contract.object_paths(durable),
+                    result,
+                    params,
+                    remediation="The object is absent from the reopened document, so the "
+                    "transform could not have been persisted.",
+                )
+            expected = write_contract.expected_transform(params)
+            if not write_contract.transform_matches(expected, found.get("transform")):
+                self._fail_read_back(
+                    method, "transform", expected, found.get("transform"), result, params
+                )
+        elif method == "model.remove_object":
+            name = str(params.get("object_name", ""))
+            remaining = write_contract.object_paths(durable)
+            if name in remaining:
+                self._fail_read_back(
+                    method,
+                    "object_absent",
+                    "no object named %s" % name,
+                    remaining,
+                    result,
+                    params,
+                    remediation="The object is still present in the reopened document, so the "
+                    "removal did not persist.",
+                )
+            stale = [path for path in (result.get("removed_paths") or ()) if path in remaining]
+            if stale:
+                self._fail_read_back(
+                    method,
+                    "removed_paths_absent",
+                    "none of %s" % (result.get("removed_paths"),),
+                    stale,
+                    result,
+                    params,
+                )
+        elif method == "model.import_geometry":
+            imported = [str(item) for item in (result.get("imported_paths") or ())]
+            if not imported:
+                self._fail_read_back(
+                    method,
+                    "imported_paths_present",
+                    "at least one imported object",
+                    "no imported paths reported",
+                    result,
+                    params,
+                )
+            remaining = write_contract.object_paths(durable)
+            missing = [path for path in imported if path not in remaining]
+            if missing:
+                self._fail_read_back(
+                    method,
+                    "imported_paths_present",
+                    imported,
+                    "absent from the reopened document: %s" % missing,
+                    result,
+                    params,
+                    remediation="The merged geometry did not survive the save.",
+                )
+
+    def _verify_produced_artifact(
+        self,
+        method: str,
+        output: Path,
+        params: Mapping[str, Any],
+        result: dict[str, Any],
+        timeout_secs: float,
+    ) -> None:
+        """Read a written file back and prove it is what the call asked for.
+
+        Document mutations are verified against the reopened scene; a written
+        file has to be verified against itself. These checks are deliberately
+        host-side and cheap: they re-read bytes the adapter just wrote, and none
+        of them needs another c4dpy launch.
+        """
+        suffix = output.suffix.lower()
+        if method == "document.render":
+            expected = [int(params.get("width", 0)), int(params.get("height", 0))]
+            actual = write_contract.image_dimensions(str(output))
+            if actual is None:
+                self._fail_read_back(
+                    method,
+                    "image_dimensions",
+                    expected,
+                    "the written image could not be decoded",
+                    result,
+                    params,
+                )
+            if [actual[0], actual[1]] != expected:
+                self._fail_read_back(
+                    method,
+                    "image_dimensions",
+                    expected,
+                    [actual[0], actual[1]],
+                    result,
+                    params,
+                    remediation="The render wrote an image at a different resolution than "
+                    "requested.",
+                )
+            result["read_back"] = write_contract.READ_BACK_COMPARED
+            return
+
+        if method == "document.save_copy":
+            reported = result.get("object_count")
+            durable = self._invoke("document.inspect", {"document_path": str(output)}, timeout_secs)
+            actual = durable.get("object_count")
+            if isinstance(reported, int) and reported != actual:
+                self._fail_read_back(
+                    method,
+                    "object_count",
+                    reported,
+                    actual,
+                    result,
+                    params,
+                    remediation="The copy does not contain the same objects as the source "
+                    "document, so it cannot be treated as a faithful copy.",
+                )
+            result["read_back"] = write_contract.READ_BACK_COMPARED
+            return
+
+        if method == "document.export":
+            matches, detail = write_contract.file_signature_matches(str(output), suffix)
+            if not matches:
+                self._fail_read_back(
+                    method,
+                    "file_format",
+                    "a file with a %s signature" % suffix,
+                    detail,
+                    result,
+                    params,
+                )
+            result["read_back"] = write_contract.read_back_level(suffix)
+            return
+
+        result["read_back"] = write_contract.READ_BACK_SIZE_ONLY
+
     def _mutate_document(
         self,
         method: str,
@@ -549,11 +791,13 @@ class Cinema4dBridge:
                     "stdout_truncated",
                 }
             }
+            self._verify_document_change(method, request, result, result["document"], timeout_secs)
             result.update(
                 {
                     "document_path": str(document),
                     "document_bytes": document.stat().st_size,
                     "document_sha256": _sha256_file(document),
+                    "read_back": write_contract.READ_BACK_COMPARED,
                 }
             )
             return result
@@ -568,6 +812,7 @@ class Cinema4dBridge:
         params: Mapping[str, Any],
         overwrite: bool,
         timeout_secs: float,
+        verify: bool = False,
     ) -> dict[str, Any]:
         replaced_existing = output.exists()
         if replaced_existing and not overwrite:
@@ -596,6 +841,8 @@ class Cinema4dBridge:
                     "overwritten": replaced_existing,
                 }
             )
+            if verify:
+                self._verify_produced_artifact(method, output, request, result, timeout_secs)
             return result
         finally:
             if staged.exists():
@@ -670,6 +917,19 @@ class Cinema4dBridge:
                 "stdout_truncated",
             }
         }
+        # Reopening is the read-back: a produced .c4d that cannot be reopened and
+        # inspected is not a document, and no in-memory payload proves otherwise.
+        count = result["document"].get("object_count")
+        if not isinstance(count, int) or count < 0:
+            self._fail_read_back(
+                "document.create",
+                "document_reopened",
+                "a well-formed document payload",
+                result["document"],
+                result,
+                {},
+            )
+        result["read_back"] = write_contract.READ_BACK_COMPARED
         return result
 
     def inspect_document(self, path: str, timeout_secs: float = 120) -> dict[str, Any]:
@@ -703,6 +963,7 @@ class Cinema4dBridge:
             {"document_path": str(source)},
             overwrite,
             timeout_secs,
+            verify=True,
         )
 
     def add_primitive(
@@ -801,6 +1062,7 @@ class Cinema4dBridge:
             {"document_path": str(document)},
             overwrite,
             timeout_secs,
+            verify=True,
         )
 
     def render_document(
@@ -826,6 +1088,7 @@ class Cinema4dBridge:
             },
             overwrite,
             timeout_secs,
+            verify=True,
         )
 
 

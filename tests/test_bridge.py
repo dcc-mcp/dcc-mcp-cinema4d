@@ -1,5 +1,7 @@
 import json
 import math
+import os
+import struct
 import sys
 from pathlib import Path
 
@@ -10,10 +12,136 @@ from dcc_mcp_cinema4d import install
 from dcc_mcp_cinema4d.bridge import BridgeError, BridgeTimeoutError, Cinema4dBridge
 
 
+def _file_identity(path) -> str:
+    """Identity that survives the staged-file rename the bridge performs.
+
+    The bridge writes to a temp file and then ``os.replace``s it onto the final
+    path, so a fake keyed on the path would lose its state at exactly the point
+    the read-back is taken. ``st_dev``/``st_ino`` follow the rename.
+    """
+    try:
+        info = os.stat(str(path), follow_symlinks=False)
+    except OSError:
+        return "missing:%s" % path
+    return "%s:%s" % (int(info.st_dev), int(info.st_ino))
+
+
+def _png_bytes(width: int, height: int) -> bytes:
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + struct.pack(">I", 13)
+        + b"IHDR"
+        + struct.pack(">II", width, height)
+        + b"\x08\x06\x00\x00\x00"
+        + b"C4D-OUTPUT"
+    )
+
+
+def _jpeg_bytes(width: int, height: int) -> bytes:
+    return (
+        b"\xff\xd8"
+        + b"\xff\xe0"
+        + struct.pack(">H", 16)
+        + b"JFIF\x00"
+        + b"\x01\x01\x00"
+        + struct.pack(">HH", 1, 1)
+        + b"\x00\x00"
+        + b"\xff\xc0"
+        + struct.pack(">H", 17)
+        + b"\x08"
+        + struct.pack(">HH", height, width)
+        + b"\x03\x01\x11\x00\x02\x11\x01\x03\x11\x01"
+        + b"C4D-OUTPUT"
+    )
+
+
+def _synthetic_bytes(suffix: str, width: int = 640, height: int = 480) -> bytes:
+    """Bytes that actually claim to be the format the suffix names.
+
+    The write-after-read contract re-reads what was written, so a fake that
+    writes ``b"C4D-OUTPUT"`` for every format would either force the contract to
+    be weakened or fail for the wrong reason.
+    """
+    lowered = suffix.lower()
+    if lowered == ".png":
+        return _png_bytes(width, height)
+    if lowered in (".jpg", ".jpeg"):
+        return _jpeg_bytes(width, height)
+    if lowered == ".glb":
+        return b"glTF\x02\x00\x00\x00" + b"C4D-OUTPUT"
+    if lowered == ".gltf":
+        return b'{"asset":{"version":"2.0"}}'
+    if lowered == ".fbx":
+        return b"Kaydara FBX Binary  \x00\x1a\x00" + b"C4D-OUTPUT"
+    if lowered == ".dae":
+        return b'<?xml version="1.0"?><COLLADA/>'
+    if lowered == ".stl":
+        return b"solid synthetic\nfacet normal 0 0 0\nendsolid synthetic\n"
+    if lowered == ".obj":
+        return b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"
+    return b"C4D-OUTPUT"
+
+
 class FakeBridge(Cinema4dBridge):
-    def __init__(self, root: Path):
+    """An in-memory model of the Cinema 4D side of the bridge.
+
+    It is deliberately stateful: ``document.inspect`` reports what earlier
+    mutations actually persisted, which is what makes the write-after-read
+    contract testable at all. A stateless fake that always returns one canned
+    payload can only ever prove the check did not crash.
+
+    ``persist=False`` models the failure the contract exists to catch: the
+    driver reports success, the save does not take, and the reopened document
+    disagrees with what was reported.
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        persist: bool = True,
+        documents: dict | None = None,
+        scene: list | None = None,
+    ):
         super().__init__(executable=sys.executable, allowed_roots=[root])
         self.calls = []
+        self.persist = persist
+        # Shareable so a test can seed a document with one bridge and then model
+        # a failing save with another; without that, "remove the object that was
+        # never there" is not a meaningful scenario.
+        self.documents: dict[str, list[dict]] = {} if documents is None else documents
+        self.scene: list[dict] = [] if scene is None else scene
+        self._next_type_id = 1000
+
+    # -- model helpers -------------------------------------------------
+    #
+    # The bridge stages every mutation through a temp copy and then `os.replace`s
+    # it onto the document, so a model keyed purely on file identity loses
+    # continuity after the first mutation. The fake therefore models what the
+    # real thing does: one scene that mutations change in place, plus separate
+    # state for each produced file.
+    def _objects(self, path):
+        produced = self.documents.get(_file_identity(path))
+        if produced is not None:
+            return [dict(item) for item in produced]
+        return [dict(item) for item in self.scene]
+
+    def _store(self, path, objects):
+        self.documents[_file_identity(path)] = [dict(item) for item in objects]
+
+    def _reopen(self, document):
+        objects = self._objects(document)
+        return {
+            "document_name": Path(document).name,
+            "object_count": len(objects),
+            "material_count": 0,
+            "objects": objects,
+            "materials": [],
+        }
+
+    def _allocate_type_id(self):
+        self._next_type_id += 1
+        return self._next_type_id
 
     def _invoke(self, method, params, timeout_secs=120):
         self.calls.append((method, dict(params), timeout_secs))
@@ -21,25 +149,133 @@ class FakeBridge(Cinema4dBridge):
         document = params.get("document_path")
         if method == "system.status":
             return {
-                "cinema4d_version": 2023200,
-                "api_version": 2023200,
+                "cinema4d_version": 26000,
+                "api_version": 26000,
                 "python_version": "3.9.0",
                 "headless": True,
             }
+        result = self._dispatch(method, params, output, document)
+        # The real bridge stamps the build onto every result; read-back failures
+        # are unreproducible without it, so the fake has to model that too.
+        result.setdefault("cinema4d_version", 26000)
+        return result
+
+    def _dispatch(self, method, params, output, document):
         if method == "document.inspect":
-            return {
-                "document_name": Path(document).name,
-                "object_count": 1,
-                "material_count": 0,
-                "objects": [],
-                "materials": [],
-            }
+            return self._reopen(document)
+        if method == "document.create":
+            if output:
+                Path(output).write_bytes(_synthetic_bytes(Path(output).suffix))
+                self._store(output, [])
+            return {"method": method}
+        if method == "document.save_copy":
+            copied = self._objects(document)
+            if output:
+                Path(output).write_bytes(_synthetic_bytes(Path(output).suffix))
+                self._store(output, copied if self.persist else [])
+            return {"method": method, "object_count": len(copied)}
+        if method == "model.add_primitive":
+            objects = self._objects(document)
+            objects.append(
+                {
+                    "name": params["name"],
+                    "path": params["name"],
+                    "depth": 0,
+                    "type_id": self._allocate_type_id(),
+                    "type_name": "Cube",
+                    "transform": {
+                        "translation": [
+                            float(item) for item in params.get("translation", (0, 0, 0))
+                        ],
+                        "rotation_hpb_degrees": [
+                            float(item) for item in params.get("rotation_hpb_degrees", (0, 0, 0))
+                        ],
+                        "scale": [float(item) for item in params.get("scale", (1, 1, 1))],
+                    },
+                }
+            )
+            return self._record_mutation(document, objects, params, created=dict(objects[-1]))
+        if method == "model.transform_object":
+            objects = self._objects(document)
+            updated = None
+            for entry in objects:
+                if entry["name"] == params["object_name"]:
+                    entry["transform"] = {
+                        "translation": [
+                            float(item) for item in params.get("translation", (0, 0, 0))
+                        ],
+                        "rotation_hpb_degrees": [
+                            float(item) for item in params.get("rotation_hpb_degrees", (0, 0, 0))
+                        ],
+                        "scale": [float(item) for item in params.get("scale", (1, 1, 1))],
+                    }
+                    updated = entry
+            extra = {"updated": dict(updated)} if updated is not None else {}
+            return self._record_mutation(document, objects, params, **extra)
+        if method == "model.remove_object":
+            objects = self._objects(document)
+            target = params["object_name"]
+            removed = [entry["path"] for entry in objects if entry["name"] == target]
+            if params.get("cascade"):
+                prefix = "%s/" % target
+                removed.extend(
+                    entry["path"] for entry in objects if entry["path"].startswith(prefix)
+                )
+                objects = [
+                    entry
+                    for entry in objects
+                    if entry["name"] != target and not entry["path"].startswith(prefix)
+                ]
+            else:
+                objects = [entry for entry in objects if entry["name"] != target]
+            return self._record_mutation(document, objects, params, removed_paths=removed)
+        if method == "model.import_geometry":
+            objects = self._objects(document)
+            name = Path(params["input_path"]).stem
+            objects.append(
+                {
+                    "name": name,
+                    "path": name,
+                    "depth": 0,
+                    "type_id": self._allocate_type_id(),
+                    "type_name": "Null",
+                    "transform": {
+                        "translation": [0.0, 0.0, 0.0],
+                        "rotation_hpb_degrees": [0.0, 0.0, 0.0],
+                        "scale": [1.0, 1.0, 1.0],
+                    },
+                }
+            )
+            return self._record_mutation(document, objects, params, imported_paths=[name])
         if output:
-            Path(output).write_bytes(b"C4D-OUTPUT")
-        elif document and method.startswith("model."):
-            with Path(document).open("ab") as stream:
-                stream.write(b"-MUTATED")
+            Path(output).write_bytes(
+                _synthetic_bytes(
+                    Path(output).suffix,
+                    width=int(params.get("width", 640)),
+                    height=int(params.get("height", 480)),
+                )
+            )
+            return {"method": method}
         return {"method": method}
+
+    def _record_mutation(self, document, objects, params, **extra):
+        """Write the staged bytes and, when persisting, the durable state.
+
+        The returned payload mirrors the driver's: it reports what the mutation
+        built in memory. ``persist=False`` models a save that did not take, so
+        the payload and the reopened document disagree — which is exactly the
+        situation the write-after-read contract must reject.
+        """
+        with Path(document).open("ab") as stream:
+            stream.write(b"-MUTATED")
+        if self.persist:
+            self.scene = [dict(item) for item in objects]
+            # Drop any produced-file state for this identity, otherwise a later
+            # reopen would return the document's pre-mutation snapshot.
+            self.documents.pop(_file_identity(document), None)
+        result: dict = {"method": "model.mutation"}
+        result.update(extra)
+        return result
 
 
 def test_status_without_c4dpy_is_actionable(tmp_path):
@@ -58,7 +294,10 @@ def test_create_document_is_atomic_and_durable(tmp_path):
     assert output.read_bytes() == b"C4D-OUTPUT"
     assert result["bytes"] == len(b"C4D-OUTPUT")
     assert len(result["sha256"]) == 64
-    assert result["document"]["object_count"] == 1
+    # A freshly created document reopens empty; anything else would mean the
+    # read-back inspected some other document.
+    assert result["document"]["object_count"] == 0
+    assert result["read_back"] == "compared"
     assert not list(tmp_path.glob(".scene.*.c4d"))
 
 
@@ -113,8 +352,9 @@ def test_output_overwrite_requires_opt_in(tmp_path):
         bridge.export_document(str(document), str(output))
 
     result = bridge.export_document(str(document), str(output), overwrite=True)
-    assert output.read_bytes() == b"C4D-OUTPUT"
+    assert output.read_bytes().startswith(b"glTF")
     assert result["overwritten"] is True
+    assert result["read_back"] == "compared"
 
 
 def _accept_synthetic_runtime_identity(monkeypatch):

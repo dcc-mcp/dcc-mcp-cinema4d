@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "host": "cinema4d",
+  "matrix_version": "2026-09-30",
+  "notes": "Single source of truth for Cinema 4D host support. Read by dcc_mcp_cinema4d.compat on the service side. A build outside `supported_ranges` is rejected explicitly; it is never silently downgraded.",
+  "version_source": {
+    "field": "c4d.GetC4DVersion()",
+    "type": "integer_build",
+    "notes": "The build is the integer returned by c4d.GetC4DVersion() inside c4dpy, for example 25000 for Cinema 4D R25.0 and 25117 for R25.117. It is NOT the product version string from the executable's file metadata: that string is formatted differently (for example '2026.1.0') and is only used by the install SOP as a coarse floor check. Mixing the two produces build numbers that are wrong by three orders of magnitude."
+  },
+  "executable_names": [
+    "c4dpy",
+    "c4dpy.exe"
+  ],
+  "driver_requires_python_major": 3,
+  "driver_requires_python_reason": "The packaged driver (cinema4d_driver.py) runs inside c4dpy and uses os.replace and text-mode open(encoding=...), neither of which exists on Python 2. Cinema 4D releases whose c4dpy ships Python 2.7 therefore cannot run this adapter at all, regardless of the build floor.",
+  "evidence_status": {
+    "real_host_ci": false,
+    "statement": "This adapter has no real-host CI: a licensed c4dpy cannot be provisioned on GitHub-hosted runners, so the `cinema4d` pytest marker is opt-in and driven by C4D_TEST_EXECUTABLE. Every c4dpy_python entry below is therefore `declared_not_executed`: it records the release-to-interpreter mapping this adapter believes to be true, NOT one that has been executed on a licensed c4dpy. Contract-level tests are contract-level evidence and are never presented here as host-level evidence.",
+    "mitigation": "The runtime check does not trust this mapping for the support decision. It gates on the interpreter version actually observed from system.status, and reports interpreter_drift whenever the observed interpreter disagrees with the declared expectation. An unverified mapping is therefore corrected by the first licensed run instead of being silently trusted."
+  },
+  "supported_ranges": [
+    {
+      "id": "R21",
+      "label": "Cinema 4D R21",
+      "min_build": 21000,
+      "max_build": 21999,
+      "status": "declared",
+      "c4dpy_python": "2.7",
+      "c4dpy_python_major": 2,
+      "confidence": "declared_not_executed",
+      "driver_compatible": false,
+      "notes": "Inside the build floor enforced by the install SOP, but the c4dpy interpreter for this release line is Python 2.7, which cannot run the packaged driver. Rejected with a specific reason rather than reported as a generic version failure."
+    },
+    {
+      "id": "R22",
+      "label": "Cinema 4D R22",
+      "min_build": 22000,
+      "max_build": 22999,
+      "status": "declared",
+      "c4dpy_python": "2.7",
+      "c4dpy_python_major": 2,
+      "confidence": "declared_not_executed",
+      "driver_compatible": false,
+      "notes": "Same Python 2.7 constraint as R21."
+    },
+    {
+      "id": "R23",
+      "label": "Cinema 4D R23",
+      "min_build": 23000,
+      "max_build": 23999,
+      "status": "declared",
+      "c4dpy_python": "3.9",
+      "c4dpy_python_major": 3,
+      "confidence": "declared_not_executed",
+      "driver_compatible": true,
+      "notes": "First release line whose c4dpy ships Python 3, which is why this is the effective floor for this adapter even though the install SOP build floor is R21."
+    },
+    {
+      "id": "S24",
+      "label": "Cinema 4D S24",
+      "min_build": 24000,
+      "max_build": 24999,
+      "status": "declared",
+      "c4dpy_python": "3.9",
+      "c4dpy_python_major": 3,
+      "confidence": "declared_not_executed",
+      "driver_compatible": true,
+      "notes": "Subscription release line between R23 and R25."
+    },
+    {
+      "id": "R25",
+      "label": "Cinema 4D R25",
+      "min_build": 25000,
+      "max_build": 25999,
+      "status": "declared",
+      "c4dpy_python": "3.9",
+      "c4dpy_python_major": 3,
+      "confidence": "declared_not_executed",
+      "driver_compatible": true,
+      "notes": "Last release line using the R-numbering scheme."
+    },
+    {
+      "id": "2023",
+      "label": "Cinema 4D 2023 (R26)",
+      "min_build": 26000,
+      "max_build": 26999,
+      "status": "declared",
+      "c4dpy_python": "3.9",
+      "c4dpy_python_major": 3,
+      "confidence": "declared_not_executed",
+      "driver_compatible": true,
+      "notes": "First release line using year numbering."
+    },
+    {
+      "id": "2024",
+      "label": "Cinema 4D 2024 (R27)",
+      "min_build": 27000,
+      "max_build": 27999,
+      "status": "declared",
+      "c4dpy_python": "3.11",
+      "c4dpy_python_major": 3,
+      "confidence": "declared_not_executed",
+      "driver_compatible": true,
+      "notes": "The Python minor version moved between release lines here, which is exactly the drift this matrix exists to surface."
+    },
+    {
+      "id": "2025",
+      "label": "Cinema 4D 2025 (R28)",
+      "min_build": 28000,
+      "max_build": 28999,
+      "status": "declared",
+      "c4dpy_python": "3.11",
+      "c4dpy_python_major": 3,
+      "confidence": "declared_not_executed",
+      "driver_compatible": true,
+      "notes": ""
+    },
+    {
+      "id": "2026",
+      "label": "Cinema 4D 2026 (R29)",
+      "min_build": 29000,
+      "max_build": 29999,
+      "status": "declared",
+      "c4dpy_python": "3.11",
+      "c4dpy_python_major": 3,
+      "confidence": "declared_not_executed",
+      "driver_compatible": true,
+      "notes": "Highest release line this matrix declares. A newer build is reported as too_new, not assumed compatible."
+    }
+  ],
+  "breaking_changes": [],
+  "breaking_changes_note": "No host API break is declared here because none has been observed on a real host. Entries are added only when a licensed run produces evidence; an empty list is the honest state for an adapter without real-host CI, not a placeholder to fill. The one constraint that is known from the adapter's own code is the Python 3 requirement on c4dpy, and it is expressed as driver_requires_python_major / driver_compatible rather than as a fabricated host API break."
+}

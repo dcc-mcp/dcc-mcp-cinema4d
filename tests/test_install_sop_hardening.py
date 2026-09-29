@@ -72,7 +72,7 @@ def _request(
 def test_uses_released_core_contract_and_official_schema(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    assert installer.MINIMUM_CORE_VERSION == "0.20.14"
+    assert installer.MINIMUM_CORE_VERSION == "0.20.36"
     installer._require_official_core_contract()
     context = _context(tmp_path)
     monkeypatch.setattr(installer, "_resolve_context", lambda *_args, **_kwargs: context)
@@ -85,6 +85,23 @@ def test_uses_released_core_contract_and_official_schema(
     assert outcome.result["schema_version"] == 1
     assert outcome.result["status"] == "planned"
     assert outcome.result["receipt_path"] == "<state>/receipt.json"
+
+
+def test_report_schema_version_follows_the_published_schema_not_the_artifact_revision() -> None:
+    """The report field is 1 while `INSTALL_SOP_SCHEMA_VERSION` tracks the artifact.
+
+    Core 0.20.36 ships schema artifact v2, whose report `schema_version` const is
+    still 1. Emitting the artifact revision produced a report that failed the
+    schema it was validated against, so the two must stay decoupled.
+    """
+    from dcc_mcp_core.deployment import INSTALL_SOP_SCHEMA_VERSION, load_install_sop_schema
+
+    schema = load_install_sop_schema()
+
+    assert schema["properties"]["schema_version"]["const"] == 1
+    assert installer._report_schema_version() == 1
+    if INSTALL_SOP_SCHEMA_VERSION != 1:
+        assert installer._report_schema_version() != INSTALL_SOP_SCHEMA_VERSION
 
 
 @pytest.mark.parametrize("operation", ["install", "status", "verify", "uninstall", "upgrade"])

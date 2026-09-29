@@ -21,7 +21,7 @@ classifiers=[
   "Programming Language :: Python :: 3.12",
   "Operating System :: OS Independent",
 ]
-dependencies=["dcc-mcp-core>=0.20.14,<1.0.0"]
+dependencies=["dcc-mcp-core>=0.20.36,<1.0.0"]
 
 [project.urls]
 Homepage="https://github.com/dcc-mcp/dcc-mcp-cinema4d"
@@ -41,7 +41,7 @@ cinema4d="dcc_mcp_cinema4d:Cinema4dMcpServer"
 
 [tool.hatch.build.targets.wheel]
 packages=["src/dcc_mcp_cinema4d"]
-artifacts=["src/dcc_mcp_cinema4d/skills/**"]
+artifacts=["src/dcc_mcp_cinema4d/skills/**", "src/dcc_mcp_cinema4d/compat_matrix.json"]
 
 [tool.hatch.build.targets.sdist]
 exclude=["docs/**/*.png", "docs/**/*.svg", "docs/**/*.webp"]

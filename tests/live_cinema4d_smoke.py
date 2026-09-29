@@ -9,11 +9,11 @@ from pathlib import Path
 from dcc_mcp_cinema4d.bridge import get_bridge
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--evidence-dir", required=True)
     parser.add_argument("--import-path")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     evidence_dir = Path(args.evidence_dir).expanduser().resolve()
     evidence_dir.mkdir(parents=True, exist_ok=True)
