@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/dcc-mcp/dcc-mcp-cinema4d/compare/v0.2.0...v0.3.0) (2026-09-29)
+
+
+### Features
+
+* add host compatibility matrix and post-write read-back contract ([65b2990](https://github.com/dcc-mcp/dcc-mcp-cinema4d/commit/65b29907f0f12d541737eccc5853703e5cf46db2))
+
 ## [0.2.0](https://github.com/dcc-mcp/dcc-mcp-cinema4d/compare/v0.1.3...v0.2.0) (2026-08-25)
 
 
