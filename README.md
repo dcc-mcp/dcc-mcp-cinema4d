@@ -18,7 +18,7 @@ _Illustrative workflow limited to the adapter's implemented primitive, transform
 **dcc-mcp-cinema4d** — Cinema 4D adapter for typed headless modeling, interchange,
 inspection, and rendering.
 
-It is one of **38 host adapters** in the DCC-MCP catalog. Every adapter speaks the same
+It is one of **47 host adapters** in the DCC-MCP catalog. Every adapter speaks the same
 MCP protocol and builds on the same core runtime contract; each one exposes the tools
 its own host needs on top of that.
 
