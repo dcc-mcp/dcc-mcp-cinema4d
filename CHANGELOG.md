@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.1](https://github.com/dcc-mcp/dcc-mcp-cinema4d/compare/v0.3.0...v0.3.1) (2026-10-13)
+
+
+### Documentation
+
+* **readme:** add the generated DCC-MCP host matrix pointer ([#16](https://github.com/dcc-mcp/dcc-mcp-cinema4d/issues/16)) ([90ee550](https://github.com/dcc-mcp/dcc-mcp-cinema4d/commit/90ee55026135390bdf2f60af4b5f9dac89c73eb9))
+* refresh the generated DCC-MCP host matrix pointer ([6c43bc8](https://github.com/dcc-mcp/dcc-mcp-cinema4d/commit/6c43bc83f0c84e343c5e92caf5bb1352bbc00893))
+
 ## [0.3.0](https://github.com/dcc-mcp/dcc-mcp-cinema4d/compare/v0.2.0...v0.3.0) (2026-09-29)
 
 
