@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.3](https://github.com/dcc-mcp/dcc-mcp-cinema4d/compare/v0.3.2...v0.3.3) (2026-11-15)
+
+
+### Bug Fixes
+
+* **ci:** keep Cinema 4D Python 3.9 on Ubuntu 24.04 ([25d03e3](https://github.com/dcc-mcp/dcc-mcp-cinema4d/commit/25d03e3202190f9ceea7e27eb2d4cd1d464504c5))
+* **ci:** retain Python 3.9 coverage on Ubuntu 24.04 ([8a58d18](https://github.com/dcc-mcp/dcc-mcp-cinema4d/commit/8a58d185e1168a33a076c78d008e28a97caa26aa))
+
+
+### Documentation
+
+* refresh the generated DCC-MCP host matrix pointer ([#24](https://github.com/dcc-mcp/dcc-mcp-cinema4d/issues/24)) ([a1c8aff](https://github.com/dcc-mcp/dcc-mcp-cinema4d/commit/a1c8aff43860e1796e44564e3472843f921b16b9))
+
 ## [0.3.2](https://github.com/dcc-mcp/dcc-mcp-cinema4d/compare/v0.3.1...v0.3.2) (2026-10-17)
 
 
